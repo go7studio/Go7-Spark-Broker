@@ -1,0 +1,24 @@
+[Unit]
+Description=Go7 Spark Capability Broker for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+EnvironmentFile=/etc/go7-spark-broker/%i.env
+ExecStart=/opt/go7-spark-broker/venv/bin/spark-broker
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/go7-spark-broker/%i -%h/workloads
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

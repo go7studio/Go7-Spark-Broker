@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "hostReserveGb": 16,
+  "maximumMemoryPressureAvg10": 5,
+  "enforceMemoryAdmission": true,
+  "probe": {
+    "endpoint": "http://127.0.0.1:9000",
+    "tokenFile": "/absolute/path/to/resource-probe-key",
+    "required": true
+  },
+  "controllers": [
+    {
+      "id": "background-workload",
+      "profileId": "gpu.background-workload",
+      "endpoint": "http://127.0.0.1:9001",
+      "tokenFile": "/absolute/path/to/background-controller-key",
+      "throttleFor": [
+        "interactive"
+      ],
+      "normalMode": "normal",
+      "throttledMode": "interactive-boost",
+      "priority": 20
+    }
+  ],
+  "sharedCertifications": []
+}

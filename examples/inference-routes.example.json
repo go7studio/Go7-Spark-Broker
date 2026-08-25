@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "routes": [
+    {
+      "id": "small-interactive",
+      "model": "your-small-model-id",
+      "profileId": "gpu.small-interactive",
+      "description": "Low-latency local text generation",
+      "endpoint": "http://127.0.0.1:8001",
+      "apiKeyFile": "/absolute/path/to/small-runtime-key",
+      "container": "small-model-runtime",
+      "estimatedMemoryGb": 24,
+      "priority": 90,
+      "serviceClasses": [
+        "interactive",
+        "batch"
+      ]
+    },
+    {
+      "id": "large-quality",
+      "model": "your-large-model-id",
+      "profileId": "gpu.large-quality",
+      "description": "Higher-quality local text generation",
+      "endpoint": "http://127.0.0.1:8002",
+      "apiKeyFile": "/absolute/path/to/large-runtime-key",
+      "container": "large-model-runtime",
+      "estimatedMemoryGb": 72,
+      "priority": 60,
+      "serviceClasses": [
+        "interactive",
+        "batch",
+        "background"
+      ]
+    }
+  ]
+}

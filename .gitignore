@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+.venv/
+venv/
+
+# Machine-owned configuration, credentials, runtime state, and generated media.
+.env
+*.token
+*.key
+local-capability-host-journal.json
+broker.sqlite3*
+artifacts/
+outputs/
+models/
+checkpoints/
+systemd/*.override.conf

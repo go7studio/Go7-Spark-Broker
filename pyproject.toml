@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "go7-spark-broker"
+version = "0.2.0"
+description = "Durable typed capability broker for DGX Spark and local inference hosts"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Go7 Studio" }]
+requires-python = ">=3.11"
+dependencies = []
+keywords = ["dgx-spark", "local-inference", "model-routing", "mcp", "artifacts"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+
+[project.urls]
+Homepage = "https://github.com/go7studio/Go7-Spark-Broker"
+Repository = "https://github.com/go7studio/Go7-Spark-Broker.git"
+Issues = "https://github.com/go7studio/Go7-Spark-Broker/issues"
+
+[project.scripts]
+spark-broker = "spark_broker.server:main"
+sparkctl = "spark_broker.cli:main"
+spark-mcp = "spark_broker.mcp_server:main"
+
+[tool.setuptools]
+packages = ["spark_broker"]
