@@ -35,6 +35,7 @@ def write_resource_policy(root: Any, endpoint: str) -> Any:
         "controllers": [],
         "sharedCertifications": [],
     }), encoding="utf-8")
+    policy.chmod(0o600)
     return policy
 
 

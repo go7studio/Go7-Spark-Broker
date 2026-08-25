@@ -19,6 +19,8 @@ from tests.helpers import request
 
 
 class FakeTextHandler(BaseHTTPRequestHandler):
+    response_model = "local-test-model"
+
     def log_message(self, fmt: str, *args: Any) -> None:
         pass
 
@@ -27,7 +29,13 @@ class FakeTextHandler(BaseHTTPRequestHandler):
             payload = json.dumps({
                 "health": "healthy", "generation": 1, "unknownConsumers": 0,
                 "activeProfiles": ["gpu.openai-compatible"],
-                "profiles": {"gpu.openai-compatible": {"health": "healthy"}},
+                "profiles": {"gpu.openai-compatible": {
+                    "health": "healthy",
+                    "identityVerified": True,
+                    "runtimeIdentity": "test-runtime:openai-compatible",
+                    "ownerId": "test.governor",
+                }},
+                "controllerStates": {},
             }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -49,7 +57,7 @@ class FakeTextHandler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length))
         prompt = body["messages"][-1]["content"]
         response = json.dumps({
-            "id": "chatcmpl-test", "object": "chat.completion", "model": "local-test-model",
+            "id": "chatcmpl-test", "object": "chat.completion", "model": self.response_model,
             "choices": [{"index": 0, "message": {"role": "assistant", "content": f"MODEL_OK:{prompt}"}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7},
         }).encode()
@@ -114,6 +122,9 @@ class ExecutorContractTests(unittest.TestCase):
         self.assertEqual([item["role"] for item in model["invocation"]["outputs"] if item["required"]], ["shape_model", "mesh_report"])
         self.assertEqual(model["continuations"][0]["capability"], "asset.3d.prepare.blender")
         self.assertEqual(model["continuations"][0]["outputs"][0]["mediaTypes"], ["model/gltf-binary"])
+        workload = self.root / "hunyuan-lifecycle"
+        workload.mkdir()
+        self.assertFalse(Hunyuan3DExecutor(workload, broker_id="spark.test").has_managed_unload())
 
     def upload(self, data: bytes, *, kind: str, media: str) -> dict[str, Any]:
         return self.registry.import_stream(io.BytesIO(data), size=len(data), kind=kind, role="input", media_type=media)
@@ -160,6 +171,35 @@ class ExecutorContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, "supported output definition") as context:
             executor.execute(job, self.registry, lambda: False, lambda _state, _detail: None)
         self.assertEqual(context.exception.code, "unsupported_media_type")
+
+    def test_openai_executor_rejects_provider_model_identity_mismatch(self) -> None:
+        class WrongModelHandler(FakeTextHandler):
+            response_model = "unexpected-model"
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), WrongModelHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            prompt = self.upload(b"identity test", kind="text", media="text/plain")
+            value = validate_job_request(request(
+                capability="text.chat.generate",
+                inputs=[{"artifactId": prompt["id"], "sha256": prompt["sha256"], "role": "prompt"}],
+                constraints={"timeoutSeconds": 30},
+            ), broker_id="spark.test")
+            job, _ = self.store.submit(value)
+            executor = OpenAIChatExecutor(
+                endpoint=f"http://127.0.0.1:{server.server_address[1]}",
+                api_key="test-key",
+                model="local-test-model",
+                container_name=None,
+            )
+            with self.assertRaises(ExecutionFailure) as context:
+                executor.execute(job, self.registry, lambda: False, lambda _state, _detail: None)
+            self.assertEqual(context.exception.code, "provider_model_mismatch")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(5)
 
     def test_openai_activation_does_not_restart_an_already_running_container(self) -> None:
         server = ThreadingHTTPServer(("127.0.0.1", 0), FakeTextHandler)

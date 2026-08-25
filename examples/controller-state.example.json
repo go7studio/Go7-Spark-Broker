@@ -1,0 +1,17 @@
+{
+  "protocolVersion": "1.0",
+  "controllerId": "background-workload",
+  "mutationId": "mutation_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "leaseId": "lease_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "fencingToken": "fence_43_cccccccccccccccccccccccccccccccc",
+  "brokerEpoch": 43,
+  "controlGeneration": 1,
+  "effectiveMode": "checkpoint-release",
+  "health": "healthy",
+  "appliedAtSafeBoundary": true,
+  "checkpoint": {
+    "runId": "run-opaque",
+    "checkpointId": "checkpoint-opaque",
+    "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  }
+}

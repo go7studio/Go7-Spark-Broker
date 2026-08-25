@@ -144,6 +144,10 @@ class Store:
                 WHERE status IN ('acquiring','active','releasing','unknown');
             CREATE INDEX IF NOT EXISTS resource_leases_job_idx
                 ON resource_leases(job_id, created_at);
+            CREATE TABLE IF NOT EXISTS controller_quanta (
+                controller_id TEXT PRIMARY KEY,
+                normal_since TEXT NOT NULL
+            );
             """
         )
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(jobs)").fetchall()}
@@ -264,6 +268,33 @@ class Store:
             rows = tx.execute("SELECT * FROM resource_leases WHERE status='unknown' ORDER BY created_at,id").fetchall()
         return [self._lease_from_row(row) for row in rows]
 
+    def controller_normal_since(self, controller_id: str) -> str:
+        """Return a durable lower bound for the controller's normal-mode run."""
+        now = utc_now()
+        with self.transaction(immediate=True) as tx:
+            tx.execute(
+                "INSERT OR IGNORE INTO controller_quanta(controller_id,normal_since) VALUES(?,?)",
+                (controller_id, now),
+            )
+            row = tx.execute(
+                "SELECT normal_since FROM controller_quanta WHERE controller_id=?",
+                (controller_id,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("controller quantum state could not be initialized")
+        return str(row["normal_since"])
+
+    def mark_controller_normal(self, controller_id: str) -> str:
+        """Start a new durable uninterrupted-normal quantum after restoration."""
+        now = utc_now()
+        with self.transaction(immediate=True) as tx:
+            tx.execute(
+                """INSERT INTO controller_quanta(controller_id,normal_since) VALUES(?,?)
+                   ON CONFLICT(controller_id) DO UPDATE SET normal_since=excluded.normal_since""",
+                (controller_id, now),
+            )
+        return now
+
     def submit(self, request: dict[str, Any], *, max_pending_jobs: int | None = None) -> tuple[dict[str, Any], bool]:
         digest = request_digest(request)
         now = utc_now()
@@ -304,6 +335,10 @@ class Store:
     def artifact_usage_bytes(self) -> int:
         row = self._connection().execute("SELECT COALESCE(SUM(size_bytes),0) AS total FROM artifacts").fetchone()
         return int(row["total"])
+
+    def artifact_relative_paths(self) -> list[str]:
+        rows = self._connection().execute("SELECT relative_path FROM artifacts").fetchall()
+        return [str(row["relative_path"]) for row in rows]
 
     def claim_next(self, supported: set[str]) -> dict[str, Any] | None:
         if not supported:

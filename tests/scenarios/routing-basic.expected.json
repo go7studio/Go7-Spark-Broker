@@ -1,0 +1,106 @@
+{
+  "version": 1,
+  "configRevision": "b635b8f8cb3a61bba9a7cd243093ca24fd1034189a9141571f97b438373e3f6d",
+  "cases": [
+    {
+      "id": "balanced-admin-priority",
+      "status": "selected",
+      "decision": {
+        "routeId": "small-interactive",
+        "profileId": "gpu.small-interactive",
+        "model": "small-model",
+        "reason": "policy:balanced",
+        "preference": "balanced",
+        "configRevision": "b635b8f8cb3a61bba9a7cd243093ca24fd1034189a9141571f97b438373e3f6d",
+        "rankedRouteIds": ["small-interactive", "large-quality"]
+      }
+    },
+    {
+      "id": "balanced-resident",
+      "status": "selected",
+      "decision": {
+        "routeId": "large-quality",
+        "profileId": "gpu.large-quality",
+        "model": "large-model",
+        "reason": "policy:balanced",
+        "preference": "balanced",
+        "configRevision": "b635b8f8cb3a61bba9a7cd243093ca24fd1034189a9141571f97b438373e3f6d",
+        "rankedRouteIds": ["large-quality", "small-interactive"]
+      }
+    },
+    {
+      "id": "latency-metric",
+      "status": "selected",
+      "decision": {
+        "routeId": "large-quality",
+        "profileId": "gpu.large-quality",
+        "model": "large-model",
+        "reason": "policy:latency",
+        "preference": "latency",
+        "configRevision": "b635b8f8cb3a61bba9a7cd243093ca24fd1034189a9141571f97b438373e3f6d",
+        "rankedRouteIds": ["large-quality", "small-interactive"]
+      }
+    },
+    {
+      "id": "throughput-metric",
+      "status": "selected",
+      "decision": {
+        "routeId": "large-quality",
+        "profileId": "gpu.large-quality",
+        "model": "large-model",
+        "reason": "policy:throughput",
+        "preference": "throughput",
+        "configRevision": "b635b8f8cb3a61bba9a7cd243093ca24fd1034189a9141571f97b438373e3f6d",
+        "rankedRouteIds": ["large-quality", "small-interactive"]
+      }
+    },
+    {
+      "id": "memory-envelope",
+      "status": "selected",
+      "decision": {
+        "routeId": "small-interactive",
+        "profileId": "gpu.small-interactive",
+        "model": "small-model",
+        "reason": "policy:memory",
+        "preference": "memory",
+        "configRevision": "b635b8f8cb3a61bba9a7cd243093ca24fd1034189a9141571f97b438373e3f6d",
+        "rankedRouteIds": ["small-interactive", "large-quality"]
+      }
+    },
+    {
+      "id": "explicit-background-model",
+      "status": "selected",
+      "decision": {
+        "routeId": "large-quality",
+        "profileId": "gpu.large-quality",
+        "model": "large-model",
+        "reason": "explicit_model",
+        "preference": "balanced",
+        "configRevision": "b635b8f8cb3a61bba9a7cd243093ca24fd1034189a9141571f97b438373e3f6d",
+        "rankedRouteIds": ["large-quality"]
+      }
+    },
+    {
+      "id": "unhealthy-fallback",
+      "status": "selected",
+      "decision": {
+        "routeId": "large-quality",
+        "profileId": "gpu.large-quality",
+        "model": "large-model",
+        "reason": "policy:balanced",
+        "preference": "balanced",
+        "configRevision": "b635b8f8cb3a61bba9a7cd243093ca24fd1034189a9141571f97b438373e3f6d",
+        "rankedRouteIds": ["large-quality"]
+      }
+    },
+    {
+      "id": "malformed-latency-rejected",
+      "status": "rejected",
+      "error": {
+        "code": "invalid_metric",
+        "message": "snapshot.profiles.gpu.small-interactive.latencyMs must be a finite non-negative number",
+        "field": "snapshot.profiles.gpu.small-interactive.latencyMs"
+      }
+    }
+  ]
+}

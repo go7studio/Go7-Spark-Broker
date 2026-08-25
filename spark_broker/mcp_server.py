@@ -50,9 +50,41 @@ TOOLS: list[dict[str, Any]] = [
     {"name": "spark_read_artifact_chunk", "description": "Read any artifact, including large GLBs, in verified base64 chunks.", "inputSchema": {"type": "object", "properties": {"artifactId": {"type": "string"}, "offset": {"type": "integer", "minimum": 0}, "length": {"type": "integer", "minimum": 1, "maximum": 4194304}}, "required": ["artifactId", "offset", "length"], "additionalProperties": False}},
 ]
 
+_TOOL_CAPABILITIES = {
+    "spark_chat": "text.chat.generate",
+    "spark_generate_3d": "asset.3d.generate",
+}
+
+
+def tools_for_capabilities(capability_document: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Publish shortcut tools only when their typed capability is installed."""
+    if not isinstance(capability_document, dict):
+        return [tool for tool in TOOLS if tool["name"] == "spark_capabilities"]
+    advertised = capability_document.get("capabilities")
+    if not isinstance(advertised, list):
+        return [tool for tool in TOOLS if tool["name"] == "spark_capabilities"]
+    installed = {
+        item.get("id") for item in advertised
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    return [
+        tool for tool in TOOLS
+        if (required := _TOOL_CAPABILITIES.get(tool["name"])) is None
+        or required in installed
+    ]
+
 
 def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     broker = client()
+    required_capability = _TOOL_CAPABILITIES.get(name)
+    if required_capability is not None:
+        document = broker.capabilities()
+        installed = {
+            item.get("id") for item in document.get("capabilities", [])
+            if isinstance(item, dict)
+        }
+        if required_capability not in installed:
+            raise ValueError(f"tool {name} is unavailable because capability {required_capability} is not installed")
     if name == "spark_capabilities":
         return broker.capabilities()
     if name == "spark_submit_job":
@@ -111,11 +143,16 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         maximum = args.get("maxBytes", 16 * 1024 * 1024)
         if metadata["sizeBytes"] > maximum:
             raise ValueError(f"artifact is {metadata['sizeBytes']} bytes, above maxBytes={maximum}")
-        data = broker.download_bytes(args["artifactId"])
+        data = broker.download_bytes(args["artifactId"], expected_sha256=metadata["sha256"])
         return {"artifact": metadata, "base64": base64.b64encode(data).decode("ascii")}
     if name == "spark_read_artifact_chunk":
         metadata = broker.artifact(args["artifactId"])["artifact"]
-        data, headers = broker.download_chunk(args["artifactId"], offset=args["offset"], length=args["length"])
+        data, headers = broker.download_chunk(
+            args["artifactId"],
+            offset=args["offset"],
+            length=args["length"],
+            expected_sha256=metadata["sha256"],
+        )
         return {
             "artifactId": args["artifactId"], "artifactSha256": metadata["sha256"], "sizeBytes": metadata["sizeBytes"],
             "offset": args["offset"], "length": len(data), "chunkSha256": hashlib.sha256(data).hexdigest(),
@@ -146,7 +183,11 @@ def handle(message: dict[str, Any]) -> None:
         response(request_id, {})
         return
     if method == "tools/list":
-        response(request_id, {"tools": TOOLS})
+        try:
+            published = tools_for_capabilities(client().capabilities())
+        except (ClientError, OSError, RuntimeError, ValueError):
+            published = tools_for_capabilities(None)
+        response(request_id, {"tools": published})
         return
     if method == "tools/call":
         params = message.get("params", {})

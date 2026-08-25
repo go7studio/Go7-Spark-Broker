@@ -3,6 +3,7 @@
   "hostReserveGb": 16,
   "maximumMemoryPressureAvg10": 5,
   "enforceMemoryAdmission": true,
+  "maximumInferenceWindowSeconds": 300,
   "probe": {
     "endpoint": "http://127.0.0.1:9000",
     "tokenFile": "/absolute/path/to/resource-probe-key",
@@ -21,6 +22,8 @@
       "normalMode": "normal",
       "throttledMode": "checkpoint-release",
       "requiresCheckpoint": true,
+      "minimumNormalSeconds": 900,
+      "timeoutSeconds": 600,
       "priority": 20
     }
   ],

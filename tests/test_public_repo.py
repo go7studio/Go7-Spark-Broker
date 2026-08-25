@@ -7,6 +7,7 @@ import re
 import json
 from pathlib import Path
 
+from spark_broker.resource_probe import ProbePolicy
 from spark_broker.resources import ResourcePolicy
 
 
@@ -84,8 +85,12 @@ class PublicRepositoryTests(unittest.TestCase):
             "systemd/go7-spark-broker.env.example",
             "examples/inference-routes.example.json",
             "examples/resource-policy.example.json",
+            "examples/resource-probe.example.json",
+            "examples/controller-state.example.json",
             "docs/RESOURCE-GOVERNOR.md",
+            "docs/RESOURCE-PROBE.md",
             "docs/TRAINING-INTEGRATION.md",
+            "docs/STAGED-ROLLOUT.md",
         ):
             self.assertTrue((ROOT / relative).is_file(), relative)
         project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
@@ -95,22 +100,52 @@ class PublicRepositoryTests(unittest.TestCase):
 
     def test_installer_is_valid_and_does_not_seed_a_model_family(self) -> None:
         subprocess.run(["bash", "-n", str(ROOT / "deploy-user.sh")], check=True)
+        subprocess.run(["bash", "-n", str(ROOT / "deploy-canary-user.sh")], check=True)
+        self.assertTrue((ROOT / "deploy-user.sh").stat().st_mode & 0o111)
+        self.assertTrue((ROOT / "deploy-canary-user.sh").stat().st_mode & 0o111)
         installer = (ROOT / "deploy-user.sh").read_text(encoding="utf-8").lower()
+        canary = (ROOT / "deploy-canary-user.sh").read_text(encoding="utf-8").lower()
         self.assertNotIn("qwen", installer)
         self.assertNotIn("hunyuan", installer)
+        self.assertNotIn("qwen", canary)
+        self.assertNotIn("hunyuan", canary)
         self.assertIn("inline secrets are refused", installer)
         self.assertIn("elif [[ ! -f \"$broker_config/env\" ]]", installer)
         self.assertIn("systemctl --user restart go7-spark-broker.service", installer)
+        self.assertIn("releases/$release_id", installer)
+        self.assertIn("health/ready", installer)
+        self.assertIn("restoring the previous release", installer)
+        self.assertIn("no config, unit, current pointer, database, or running service was changed", installer)
+        installer_rollback = installer.split("rollback()", 1)[1].split("on_error()", 1)[0]
+        canary_rollback = canary.split("rollback()", 1)[1].split("on_error()", 1)[0]
+        self.assertNotIn("sqlite3.connect", installer_rollback)
+        self.assertNotIn("sqlite3.connect", canary_rollback)
+        self.assertIn("releases/$release_id", canary)
+        self.assertIn("health/ready", canary)
+        self.assertIn("rollback", canary)
+        self.assertIn("no config, unit, current pointer, database, or running service was changed", canary)
 
     def test_shipped_json_examples_are_current_and_strict(self) -> None:
         routes = json.loads((ROOT / "examples/inference-routes.example.json").read_text(encoding="utf-8"))
         self.assertEqual(routes["version"], 1)
         self.assertTrue(routes["routes"])
-        policy = ResourcePolicy.from_file(ROOT / "examples/resource-policy.example.json")
+        policy = ResourcePolicy.from_value(json.loads(
+            (ROOT / "examples/resource-policy.example.json").read_text(encoding="utf-8")
+        ))
         self.assertTrue(policy.require_probe)
         self.assertTrue(policy.enforce_memory_admission)
         self.assertEqual(policy.controllers[0].workload_kind, "training")
         self.assertTrue(policy.controllers[0].requires_checkpoint)
+        self.assertEqual(policy.controllers[0].timeout_seconds, 600)
+        probe = ProbePolicy.from_bytes(
+            (ROOT / "examples/resource-probe.example.json").read_bytes()
+        )
+        self.assertEqual(probe.controller_state_files[0].id, policy.controllers[0].id)
+        controller_state = json.loads(
+            (ROOT / "examples/controller-state.example.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(controller_state["controllerId"], policy.controllers[0].id)
+        self.assertRegex(controller_state["mutationId"], r"^mutation_[a-f0-9]{32}$")
 
 
 if __name__ == "__main__":

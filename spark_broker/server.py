@@ -14,10 +14,11 @@ from pathlib import Path
 from typing import Any
 
 from . import BROKER_VERSION, PROTOCOL_VERSION
-from .artifacts import ArtifactError, ArtifactRegistry
+from .artifacts import ArtifactError, ArtifactIntegrityError, ArtifactNotFound, ArtifactRegistry
 from .contract import ContractError, validate_job_request, validate_upload_metadata
 from .executors import build_executors, load_openai_routes
 from .resources import ResourceCoordinator, ResourcePolicy
+from .secure_files import SecureFileError, read_owner_secret
 from .scheduler import Scheduler
 from .store import IdempotencyConflict, QueueFull, Store
 
@@ -64,7 +65,7 @@ class Config:
         if token and not allow_inline:
             raise SystemExit("inline broker secrets are refused; use SPARK_BROKER_TOKEN_FILE")
         if not token and token_file:
-            token = _read_credential(Path(token_file), "broker token")
+            token = _read_credential(Path(token_file), "broker token", minimum_length=32)
         if len(token) < 32:
             raise SystemExit("SPARK_BROKER_TOKEN or SPARK_BROKER_TOKEN_FILE must contain at least 32 characters")
         hunyuan = os.environ.get("SPARK_HUNYUAN_ROOT", "")
@@ -73,7 +74,7 @@ class Config:
         if text_key and not allow_inline:
             raise SystemExit("inline model-server secrets are refused; use SPARK_OPENAI_API_KEY_FILE")
         if not text_key and text_key_file:
-            text_key = _read_credential(Path(text_key_file), "model-server credential")
+            text_key = _read_credential(Path(text_key_file), "model-server credential", minimum_length=8)
         text_endpoint = os.environ.get("SPARK_OPENAI_ENDPOINT", os.environ.get("SPARK_TEXT_ENDPOINT", ""))
         text_model = os.environ.get("SPARK_OPENAI_MODEL", os.environ.get("SPARK_TEXT_MODEL", ""))
         if any((text_endpoint, text_key, text_model)) and not all((text_endpoint, text_key, text_model)):
@@ -111,16 +112,11 @@ class Config:
         )
 
 
-def _read_credential(path: Path, label: str) -> str:
+def _read_credential(path: Path, label: str, *, minimum_length: int) -> str:
     try:
-        stat = path.stat()
-    except OSError as exc:
-        raise SystemExit(f"{label} file cannot be read") from exc
-    if stat.st_uid != os.geteuid():
-        raise SystemExit(f"{label} file must be owned by the service account")
-    if stat.st_mode & 0o077:
-        raise SystemExit(f"{label} file permissions must be 0600 or stricter")
-    return path.read_text(encoding="utf-8").strip()
+        return read_owner_secret(path, label, minimum_length=minimum_length)
+    except SecureFileError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 class Broker:
@@ -187,11 +183,19 @@ class Broker:
                 or not policy.probe_token_file
             ):
                 raise ValueError("GPU capabilities require a resource policy with required probe and memory admission")
-            if policy.controllers and any(
-                executor.capability.resource_group is not None and not executor.has_managed_unload()
-                for executor in self.executors.values()
-            ):
-                raise ValueError("controller-backed GPU profiles require a broker-managed unload lifecycle")
+            profile_lifecycles: dict[str, bool] = {}
+            for executor in self.executors.values():
+                for profile_id, managed in executor.gpu_profile_lifecycles().items():
+                    profile_lifecycles[profile_id] = profile_lifecycles.get(profile_id, True) and managed
+            gpu_profiles = set(profile_lifecycles)
+            unmanaged_profiles = {
+                profile_id for profile_id, managed in profile_lifecycles.items() if not managed
+            }
+            if unmanaged_profiles and (policy.controllers or len(gpu_profiles) > 1):
+                raise ValueError(
+                    "controller-backed or multi-profile GPU routing requires a "
+                    "broker-managed unload lifecycle for every GPU profile"
+                )
         self.coordinator = ResourceCoordinator(
             store=self.store,
             data_root=config.data_root,
@@ -389,8 +393,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 params.get("kind", [""])[0], params.get("role", [""])[0], params.get("mediaType", [self.headers.get("Content-Type", "")])[0]
             )
             expected = self.headers.get("X-Content-SHA256")
-            if expected and not re.fullmatch(r"[a-f0-9]{64}", expected):
-                raise ContractError("invalid_hash", "X-Content-SHA256 must be lowercase hex")
+            if not expected or not re.fullmatch(r"[a-f0-9]{64}", expected):
+                raise ContractError("invalid_hash", "X-Content-SHA256 is required and must be lowercase hex")
             artifact = self.server.broker.registry.import_stream(
                 self.rfile,
                 size=content_length,
@@ -432,9 +436,12 @@ class BrokerHandler(BaseHTTPRequestHandler):
     def _artifact_route(self, method: str, parts: list[str]) -> None:
         artifact_id = parts[2]
         try:
-            artifact, path = self.server.broker.registry.resolve(artifact_id, verify=False)
-        except ArtifactError:
+            artifact, path = self.server.broker.registry.resolve(artifact_id, verify=True)
+        except ArtifactNotFound:
             self._error(HTTPStatus.NOT_FOUND, "artifact_not_found", "artifact not found")
+            return
+        except ArtifactIntegrityError:
+            self._error(HTTPStatus.CONFLICT, "artifact_integrity_failed", "registered artifact failed integrity verification")
             return
         if len(parts) == 3 and method == "GET":
             self._json(HTTPStatus.OK, {"protocolVersion": PROTOCOL_VERSION, "artifact": artifact})

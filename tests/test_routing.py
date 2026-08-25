@@ -9,6 +9,7 @@ from pathlib import Path
 from spark_broker.artifacts import ArtifactRegistry
 from spark_broker.contract import ContractError, validate_job_request
 from spark_broker.executors import OpenAIRoute, RoutedOpenAIChatExecutor, load_openai_routes
+from spark_broker.routing import compile_routing_config
 from spark_broker.store import Store
 from tests.helpers import request
 
@@ -98,9 +99,15 @@ class InferenceRoutingTests(unittest.TestCase):
                 "serviceClasses": ["interactive"],
             }],
         }), encoding="utf-8")
+        route_file.chmod(0o600)
+        compiled = compile_routing_config(json.loads(route_file.read_text(encoding="utf-8")))
         loaded = load_openai_routes(route_file)
         self.assertEqual(loaded[0].id, "local-small")
         self.assertEqual(loaded[0].api_key, "test-key")
+        executor = RoutedOpenAIChatExecutor(loaded)
+        self.assertEqual(executor.installed_config_revision, compiled.revision)
+        self.assertEqual(executor.public_routes()[0]["configRevision"], compiled.revision)
+        self.assertNotEqual(executor.routing_config.revision, compiled.revision)
         unsafe = json.loads(route_file.read_text(encoding="utf-8"))
         unsafe["routes"][0]["endpoint"] = "https://public.example.invalid"
         route_file.write_text(json.dumps(unsafe), encoding="utf-8")

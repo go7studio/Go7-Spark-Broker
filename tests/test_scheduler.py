@@ -86,6 +86,20 @@ class PartialActivationExecutor(Executor):
         raise AssertionError("execute must not run")
 
 
+class DeferringExecutor(Executor):
+    capability = Capability(
+        "gpu.deferred.test", "gpu.deferred", "deferred test", (), (), 1,
+        resource_group="gpu:0", service_class="interactive", lease_mode="exclusive",
+    )
+
+    def activate(self, cancelled):
+        del cancelled
+        raise AdmissionDeferred("resource_busy", "resource is temporarily busy", retry_after_seconds=30)
+
+    def execute(self, job, registry, cancelled, stage):
+        raise AssertionError("execute must not run after deferred activation")
+
+
 class ReleaseFailingCoordinator:
     def __init__(self) -> None:
         self.release_calls = 0
@@ -102,6 +116,9 @@ class ReleaseFailingCoordinator:
 
     def verify_activation(self, handle, plan):
         del handle, plan
+
+    def configure_execution_control(self, plan, control):
+        del plan, control
 
     def release(self, handle):
         del handle
@@ -312,6 +329,32 @@ class SchedulerTests(unittest.TestCase):
             scheduler.stop()
         self.assertEqual(finished["status"], "failed")
         self.assertTrue(executor.deactivated)
+
+    def test_deferred_job_does_not_block_other_runnable_work(self) -> None:
+        self.scheduler.stop()
+        deferred = DeferringExecutor()
+        echo = EchoExecutor()
+        scheduler = Scheduler(
+            broker_id="spark.test", store=self.store, registry=self.registry,
+            executors={deferred.capability.id: deferred, echo.capability.id: echo},
+        )
+        blocked_value = validate_job_request(request(
+            capability=deferred.capability.id, priority=100,
+            idempotencyKey="deferred-does-not-block",
+        ), broker_id="spark.test")
+        echo_value = validate_job_request(request(
+            priority=10, idempotencyKey="runnable-behind-deferred",
+        ), broker_id="spark.test")
+        blocked_job, _ = self.store.submit(blocked_value)
+        echo_job, _ = self.store.submit(echo_value)
+        scheduler.start()
+        scheduler.notify()
+        try:
+            finished = self.wait(echo_job["id"])
+        finally:
+            scheduler.stop()
+        self.assertEqual(finished["status"], "completed")
+        self.assertEqual(self.store.get_job(blocked_job["id"])["status"], "queued")
 
     def test_control_loop_failure_stops_main_claiming_loop(self) -> None:
         self.scheduler.stop()

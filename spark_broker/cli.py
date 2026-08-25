@@ -12,6 +12,7 @@ from typing import Any
 
 from . import PROTOCOL_VERSION
 from .client import BrokerClient, ClientError, read_credential
+from .routing import RoutingError, compile_routing_config, simulate_routing_scenarios
 
 
 TERMINAL = {"completed", "failed", "cancelled", "interrupted"}
@@ -70,6 +71,11 @@ def parser() -> argparse.ArgumentParser:
     sub = root.add_subparsers(dest="command", required=True)
     sub.add_parser("capabilities")
     sub.add_parser("status")
+
+    route_validate = sub.add_parser("route-validate", help="validate and fingerprint a routing config without contacting the broker")
+    route_validate.add_argument("config", type=Path)
+    route_simulate = sub.add_parser("route-simulate", help="run a pure routing scenario without contacting runtimes")
+    route_simulate.add_argument("scenario", type=Path)
 
     upload = sub.add_parser("upload")
     upload.add_argument("path", type=Path)
@@ -133,6 +139,20 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = parser().parse_args()
+    if args.command in {"route-validate", "route-simulate"}:
+        path = args.config if args.command == "route-validate" else args.scenario
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            result = (
+                compile_routing_config(value).public()
+                if args.command == "route-validate"
+                else simulate_routing_scenarios(value)
+            )
+        except (OSError, json.JSONDecodeError, RoutingError) as exc:
+            print(json.dumps({"error": {"code": "invalid_routing_input", "message": str(exc)}}), file=sys.stderr)
+            raise SystemExit(2) from exc
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
     client = client_from_args(args)
     try:
         if args.command == "capabilities":

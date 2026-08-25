@@ -18,13 +18,19 @@ before the network call. Controller and probe bearer credentials must be
 service-owned files with mode `0600` or stricter. All endpoints are HTTP
 loopback URLs; proxy environment variables and redirects are ignored.
 
-## Shared causal generation
+## Causal mutation observation
 
-The resource probe and every controller response use one host-wide,
-monotonically increasing `snapshotGeneration` domain. A controller increments
-that generation only after its requested state is observable in the resource
-inventory. The broker rejects a post-control snapshot whose `generation` is
-older than the acknowledgement. Generations must survive controller restarts.
+The broker assigns every controller request a cryptographically random
+`mutationId`. Before acknowledging, the controller atomically publishes its
+fenced state to the administrator-configured state file consumed by the
+read-only resource probe. A later probe snapshot must both advance its durable
+observation `generation` and contain the exact mutation, lease, fence, epoch,
+control generation, effective mode, safe-boundary result, and checkpoint proof.
+
+This separates two responsibilities: the probe generation orders observations;
+the unique mutation identity proves which controller operation was observed.
+A routine probe read can advance the generation, but it cannot fabricate the
+matching mutation record, so it can never make a stale acknowledgement causal.
 
 ## Resource snapshot
 
@@ -39,12 +45,42 @@ The broker reads authenticated `GET /v1/resource-snapshot`:
   "profiles": {
     "gpu.training-main": {
       "health": "healthy",
+      "identityVerified": true,
+      "runtimeIdentity": "oci-sha256:opaque-reviewed-runtime-digest",
+      "ownerId": "spark.governor",
       "latencyMs": 180,
       "availableConcurrency": 1
+    }
+  },
+  "controllerStates": {
+    "background-workload": {
+      "protocolVersion": "1.0",
+      "controllerId": "background-workload",
+      "mutationId": "mutation_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "leaseId": "lease_opaque",
+      "fencingToken": "fence_opaque",
+      "brokerEpoch": 43,
+      "controlGeneration": 1,
+      "effectiveMode": "checkpoint-release",
+      "health": "healthy",
+      "appliedAtSafeBoundary": true,
+      "checkpoint": {
+        "runId": "run_opaque",
+        "checkpointId": "checkpoint_opaque",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
     }
   }
 }
 ```
+
+All six top-level fields shown above are mandatory; `controllerStates` is an
+empty object when no controller has published state. Missing
+`unknownConsumers`, `activeProfiles`, `profiles`, or `controllerStates` never means empty. Every
+active profile must have an inventory record with `health`,
+`identityVerified: true`, a non-empty immutable `runtimeIdentity`, and the
+administrator-installed `ownerId` that performed the process/cgroup/runtime
+binding. A profile name by itself is not runtime identity.
 
 `unknownConsumers` counts GPU/CUDA consumers the governor cannot bind to a
 known administrator-installed profile. Any positive value closes admission;
@@ -60,6 +96,7 @@ For each affected controller, the broker sends authenticated
 ```json
 {
   "protocolVersion": "1.0",
+  "mutationId": "mutation_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "leaseId": "lease_opaque",
   "fencingToken": "fence_opaque",
   "brokerEpoch": 43,
@@ -73,6 +110,7 @@ A successful response is:
 
 ```json
 {
+  "mutationId": "mutation_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "leaseId": "lease_opaque",
   "fencingToken": "fence_opaque",
   "brokerEpoch": 43,
@@ -80,7 +118,6 @@ A successful response is:
   "effectiveMode": "checkpoint-release",
   "health": "healthy",
   "appliedAtSafeBoundary": true,
-  "snapshotGeneration": 44,
   "checkpoint": {
     "runId": "run_opaque",
     "checkpointId": "checkpoint_opaque",
@@ -95,11 +132,27 @@ required while restoring `normalMode`. The manifest digest identifies an
 immutable durable checkpoint collection; it is not a local directory claim.
 
 Controllers must persist the greatest accepted broker epoch, active lease
-fence, greatest control generation for that fence, effective mode, and shared
-snapshot generation before replying. They must reject an older epoch, a
+fence, greatest control generation for that fence, mutation identity, effective
+mode, and checkpoint proof before replying. The same atomic state must be
+published to the probe-observed state file before the response is sent. They must reject an older epoch, a
 different active lease at the same epoch, or a lower generation. Repeating the
 same generation and payload is idempotent. `health: degraded`, a missing safe
-boundary, a mismatched echo, or a stale snapshot generation is failure.
+boundary, a mismatched echo, or an unobserved mutation is failure.
+
+Each controller policy may set `timeoutSeconds` from 1 through 3600. Set it
+above the measured worst-case safe-boundary plus checkpoint-publication time;
+the default is 600 seconds. A timeout remains an unknown mutation outcome and
+fails closed—it never authorizes inference.
+
+Training controllers must also set `minimumNormalSeconds` (1 through 86400),
+and the resource policy must set `maximumInferenceWindowSeconds` (10 through
+3600). The broker persists when each training controller was observably
+restored to normal mode. It defers another displacement until the minimum
+uninterrupted quantum has elapsed, including across broker restarts. After
+admission it caps blocking model calls and cooperative execution at the maximum
+inference window; expiry cancels the routed work and proceeds through the same
+verified unload-and-restore path. These broker limits complement, rather than
+replace, controller-side scheduling and gateway drain.
 
 ## Restart takeover
 
@@ -111,6 +164,7 @@ unknown consumers absent, it may send authenticated
 ```json
 {
   "protocolVersion": "1.0",
+  "mutationId": "mutation_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "previousLeaseId": "lease_old",
   "previousFencingToken": "fence_old",
   "recoveryFencingToken": "fence_44_recovery_opaque",
@@ -123,11 +177,12 @@ unknown consumers absent, it may send authenticated
 
 The controller atomically compares the previous lease and fence with its
 persisted state, verifies that `brokerEpoch` is newer, adopts the recovery
-fence, applies the target mode, advances the shared snapshot generation, and
-returns:
+fence, applies the target mode, publishes the new mutation state for the probe,
+and returns:
 
 ```json
 {
+  "mutationId": "mutation_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "previousLeaseId": "lease_old",
   "previousFencingToken": "fence_old",
   "recoveryFencingToken": "fence_44_recovery_opaque",
@@ -135,8 +190,7 @@ returns:
   "acknowledgedGeneration": 1000001,
   "effectiveMode": "normal",
   "health": "healthy",
-  "appliedAtSafeBoundary": true,
-  "snapshotGeneration": 45
+  "appliedAtSafeBoundary": true
 }
 ```
 
@@ -146,8 +200,8 @@ keeps the stale lease `unknown` and the host quarantined.
 ## Admission and release order
 
 Admission order is: validate request, select route, sample resources, journal
-lease and control intent, apply controller mode, verify acknowledgement,
-re-sample the causal generation, check memory and compatibility, activate the
+lease, mutation identity, and compensation, apply controller mode, verify the
+acknowledgement, re-sample and match the exact mutation state, check memory and compatibility, activate the
 selected runtime, and re-sample activation.
 
 Release order is deliberately reversed: complete or cancel work, unload the

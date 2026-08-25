@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "ownerId": "spark.probe",
+  "profiles": [
+    {
+      "id": "gpu.local-text",
+      "type": "docker",
+      "container": "installed-text-runtime",
+      "expectedIdentity": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "id": "gpu.background-training",
+      "type": "systemd-user",
+      "unit": "installed-training.service",
+      "expectedIdentity": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ],
+  "controllerStateFiles": [
+    {
+      "id": "background-workload",
+      "stateFile": "/var/lib/go7-spark-controller/background-workload-state.json"
+    }
+  ]
+}

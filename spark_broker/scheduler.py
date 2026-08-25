@@ -182,6 +182,7 @@ class Scheduler:
             self.store.transition(job["id"], "loading", detail={"plan": plan.public()}, profile_id=plan.profile_id)
             if self.coordinator:
                 lease = self.coordinator.acquire(job, plan, control)
+                self.coordinator.configure_execution_control(plan, control)
             activated = True
             executor.activate_plan(plan, control)
             if self.coordinator:
@@ -235,8 +236,6 @@ class Scheduler:
                     detail={"code": exc.code, "message": str(exc), **exc.detail},
                     delay_seconds=exc.retry_after_seconds,
                 )
-                self._wake.wait(exc.retry_after_seconds)
-                self._wake.clear()
         except ExecutionCancelled as exc:
             self.store.fail(job["id"], {"code": "cancelled", "message": str(exc), "retryable": False}, status="cancelled")
         except ContractError as exc:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import urllib.error
 import urllib.parse
@@ -10,6 +9,8 @@ import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any
+
+from .secure_files import SecureFileError, read_owner_secret
 
 
 class ClientError(RuntimeError):
@@ -27,15 +28,9 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def read_credential(path: Path, label: str = "broker token") -> str:
     try:
-        stat = path.stat()
-        if stat.st_uid != os.geteuid() or stat.st_mode & 0o077:
-            raise ValueError(f"{label} file must be owned by the current account and mode 0600 or stricter")
-        value = path.read_text(encoding="utf-8").strip()
-    except OSError as exc:
-        raise ValueError(f"{label} file cannot be read") from exc
-    if len(value) < 32:
-        raise ValueError(f"{label} is missing or too short")
-    return value
+        return read_owner_secret(path, label)
+    except SecureFileError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 class BrokerClient:
@@ -110,7 +105,10 @@ class BrokerClient:
             with temporary.open("wb") as target:
                 while received < metadata["sizeBytes"]:
                     data, _headers = self.download_chunk(
-                        artifact_id, offset=received, length=min(4 * 1024 * 1024, metadata["sizeBytes"] - received)
+                        artifact_id,
+                        offset=received,
+                        length=min(4 * 1024 * 1024, metadata["sizeBytes"] - received),
+                        expected_sha256=metadata["sha256"],
                     )
                     if not data:
                         raise ClientError(0, "short_download", "artifact download ended before the registered size")
@@ -124,7 +122,7 @@ class BrokerClient:
             raise
         temporary.replace(destination)
 
-    def download_bytes(self, artifact_id: str) -> bytes:
+    def download_bytes(self, artifact_id: str, *, expected_sha256: str | None = None) -> bytes:
         request = urllib.request.Request(
             f"{self.base_url}/v1/artifacts/{urllib.parse.quote(artifact_id, safe='')}/content",
             headers={"Authorization": f"Bearer {self.token}"},
@@ -133,14 +131,25 @@ class BrokerClient:
             with self._opener.open(request, timeout=self.timeout) as response:
                 data = response.read()
                 expected = response.headers.get("X-Content-SHA256")
-                if expected and hashlib.sha256(data).hexdigest() != expected:
+                if not expected or not re.fullmatch(r"[a-f0-9]{64}", expected):
+                    raise ClientError(response.status, "missing_integrity", "artifact response omitted a valid content digest")
+                if expected_sha256 is not None and expected != expected_sha256:
+                    raise ClientError(response.status, "hash_mismatch", "artifact response digest did not match its metadata")
+                if hashlib.sha256(data).hexdigest() != expected:
                     raise ClientError(response.status, "hash_mismatch", "downloaded artifact failed integrity check")
                 return data
         except urllib.error.HTTPError as exc:
             self._raise_http(exc)
         raise AssertionError("unreachable")
 
-    def download_chunk(self, artifact_id: str, *, offset: int, length: int) -> tuple[bytes, dict[str, str]]:
+    def download_chunk(
+        self,
+        artifact_id: str,
+        *,
+        offset: int,
+        length: int,
+        expected_sha256: str | None = None,
+    ) -> tuple[bytes, dict[str, str]]:
         if offset < 0 or length < 1:
             raise ValueError("offset must be non-negative and length must be positive")
         request = urllib.request.Request(
@@ -159,6 +168,11 @@ class BrokerClient:
                 data = response.read(expected_length + 1)
                 if len(data) != expected_length:
                     raise ClientError(response.status, "invalid_range", "artifact server returned a byte range with the wrong length")
+                artifact_digest = response.headers.get("X-Content-SHA256")
+                if not artifact_digest or not re.fullmatch(r"[a-f0-9]{64}", artifact_digest):
+                    raise ClientError(response.status, "missing_integrity", "artifact range omitted a valid content digest")
+                if expected_sha256 is not None and artifact_digest != expected_sha256:
+                    raise ClientError(response.status, "hash_mismatch", "artifact range digest did not match its metadata")
                 return data, {key: value for key, value in response.headers.items()}
         except urllib.error.HTTPError as exc:
             self._raise_http(exc)

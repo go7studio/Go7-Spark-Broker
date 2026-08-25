@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import threading
 import time
@@ -18,6 +20,8 @@ from typing import Any, Callable
 from .artifacts import ArtifactRegistry
 from .contract import ContractError
 from .resources import ExecutionPlan
+from .routing import RoutingError, compile_route_policies, compile_routing_config
+from .secure_files import SecureFileError, read_owner_secret, read_owner_text
 
 
 class ExecutionCancelled(RuntimeError):
@@ -185,6 +189,11 @@ class Executor:
     def has_managed_unload(self) -> bool:
         return self.capability.resource_group is None
 
+    def gpu_profile_lifecycles(self) -> dict[str, bool]:
+        if self.capability.resource_group is None:
+            return {}
+        return {self.capability.profile_id: self.has_managed_unload()}
+
     def activate(self, cancelled: Callable[[], bool]) -> None:
         del cancelled
 
@@ -303,7 +312,11 @@ class Hunyuan3DExecutor(Executor):
         return (self.workload_root / "compose.yaml").is_file() and (self.workload_root / "assets").is_dir() and (self.workload_root / "out").is_dir()
 
     def has_managed_unload(self) -> bool:
-        return True
+        # The current adapter launches a job-scoped compose container inside
+        # execute(), after the coordinator's activation check. Cleanup is
+        # broker-owned, but the runtime is not yet probe-observable at the
+        # activation barrier, so it must not participate in profile rotation.
+        return False
 
     def deactivate_plan(self, plan: ExecutionPlan) -> bool:
         del plan
@@ -446,6 +459,8 @@ class Hunyuan3DExecutor(Executor):
                 ["scripts/shape_infer.py", "--image", f"/workspace/assets/{source_name}", "--out", f"/workspace/out/{shape_name}", "--seed", str(constraints["seed"])],
                 constraints["maxRunSeconds"],
             )
+            shape_path = self.workload_root / "out" / shape_name
+            shape_generated_sha = self._file_sha256(shape_path)
             stage("validating", {"stage": "shape_validation"})
             run_compose(
                 "validate-shape",
@@ -453,6 +468,9 @@ class Hunyuan3DExecutor(Executor):
                 ["scripts/validate_mesh.py", f"/workspace/out/{shape_name}", "--json", f"/workspace/out/{shape_report_name}"],
                 300,
             )
+            shape_validated_sha = self._file_sha256(shape_path)
+            if shape_validated_sha != shape_generated_sha:
+                raise ExecutionFailure("mesh_changed_during_validation", "shape mesh changed while it was being validated")
             shape_report = self._report(
                 self.workload_root / "out" / shape_report_name,
                 constraints,
@@ -460,13 +478,14 @@ class Hunyuan3DExecutor(Executor):
             )
             self._persist_report(self.workload_root / "out" / shape_report_name, shape_report)
             shape_artifact = registry.import_file(
-                self.workload_root / "out" / shape_name,
+                shape_path,
                 kind="model3d",
                 role="shape_model",
                 media_type="model/gltf-binary",
                 job_id=job["id"],
                 metadata={"format": "glb", "units": constraints["units"], "upAxis": constraints["upAxis"], "sourceArtifactId": input_artifact["id"]},
                 validation=shape_report,
+                expected_sha256=shape_validated_sha,
             )
             artifacts.append(shape_artifact)
             report_artifact = registry.import_file(
@@ -477,6 +496,7 @@ class Hunyuan3DExecutor(Executor):
                 job_id=job["id"],
                 metadata={"modelArtifactId": shape_artifact["id"]},
                 validation={"schema": "go7.mesh-validation.v1", "valid": bool(shape_report.get("valid"))},
+                expected_sha256=self._file_sha256(self.workload_root / "out" / shape_report_name),
             )
             artifacts.append(report_artifact)
 
@@ -494,6 +514,8 @@ class Hunyuan3DExecutor(Executor):
                     ],
                     constraints["maxRunSeconds"],
                 )
+                pbr_path = self.workload_root / "out" / pbr_name
+                pbr_generated_sha = self._file_sha256(pbr_path)
                 stage("validating", {"stage": "pbr_validation"})
                 run_compose(
                     "validate-pbr",
@@ -501,6 +523,9 @@ class Hunyuan3DExecutor(Executor):
                     ["scripts/validate_mesh.py", f"/workspace/out/{pbr_name}", "--json", f"/workspace/out/{pbr_report_name}"],
                     300,
                 )
+                pbr_validated_sha = self._file_sha256(pbr_path)
+                if pbr_validated_sha != pbr_generated_sha:
+                    raise ExecutionFailure("mesh_changed_during_validation", "PBR mesh changed while it was being validated")
                 pbr_report = self._report(
                     self.workload_root / "out" / pbr_report_name,
                     constraints,
@@ -508,13 +533,14 @@ class Hunyuan3DExecutor(Executor):
                 )
                 self._persist_report(self.workload_root / "out" / pbr_report_name, pbr_report)
                 final_model = registry.import_file(
-                    self.workload_root / "out" / pbr_name,
+                    pbr_path,
                     kind="model3d",
                     role="pbr_model",
                     media_type="model/gltf-binary",
                     job_id=job["id"],
                     metadata={"format": "glb", "units": constraints["units"], "upAxis": constraints["upAxis"], "sourceArtifactId": input_artifact["id"], "derivedFrom": shape_artifact["id"]},
                     validation=pbr_report,
+                    expected_sha256=pbr_validated_sha,
                 )
                 artifacts.append(final_model)
                 artifacts.append(registry.import_file(
@@ -525,6 +551,7 @@ class Hunyuan3DExecutor(Executor):
                     job_id=job["id"],
                     metadata={"modelArtifactId": final_model["id"]},
                     validation={"schema": "go7.mesh-validation.v1", "valid": bool(pbr_report.get("valid"))},
+                    expected_sha256=self._file_sha256(self.workload_root / "out" / pbr_report_name),
                 ))
             if log_path.exists():
                 artifacts.append(registry.import_file(
@@ -628,10 +655,40 @@ class Hunyuan3DExecutor(Executor):
     def _persist_report(path: Path, report: dict[str, Any]) -> None:
         staged = path.with_name(f".{path.name}.validated-{os.getpid()}-{threading.get_ident()}")
         try:
-            staged.write_text(json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+            with staged.open("w", encoding="utf-8") as stream:
+                stream.write(json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
             os.replace(staged, path)
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
         finally:
             staged.unlink(missing_ok=True)
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise ExecutionFailure("output_unavailable", "generated output cannot be opened safely") from exc
+        digest = hashlib.sha256()
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ExecutionFailure("output_unavailable", "generated output is not a regular file")
+            while chunk := os.read(descriptor, 1024 * 1024):
+                digest.update(chunk)
+        finally:
+            os.close(descriptor)
+        return digest.hexdigest()
 
     @staticmethod
     def _blender_continuation(job: dict[str, Any], model: dict[str, Any]) -> dict[str, Any]:
@@ -874,8 +931,12 @@ class OpenAIChatExecutor(Executor):
             method="POST",
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json", "Accept": "application/json"},
         )
+        request_timeout = constraints["timeoutSeconds"]
+        bounded_timeout = getattr(cancelled, "bounded_timeout", None)
+        if callable(bounded_timeout):
+            request_timeout = bounded_timeout(request_timeout)
         try:
-            with self._opener.open(http_request, timeout=constraints["timeoutSeconds"]) as response:
+            with self._opener.open(http_request, timeout=request_timeout) as response:
                 limit = 4 * 1024 * 1024
                 response_bytes = response.read(limit + 1)
                 if len(response_bytes) > limit:
@@ -897,6 +958,12 @@ class OpenAIChatExecutor(Executor):
                 raise TypeError
         except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
             raise ExecutionFailure("invalid_provider_response", "text provider response did not match the OpenAI chat schema") from exc
+        if response_json.get("model") != self.model:
+            raise ExecutionFailure(
+                "provider_model_mismatch",
+                "text provider response model did not match the selected installed route",
+                retryable=False,
+            )
         work = registry.root / ".staging"
         text_path = work / f"{job['id']}-text.txt"
         json_path = work / f"{job['id']}-provider.json"
@@ -906,15 +973,15 @@ class OpenAIChatExecutor(Executor):
             usage = response_json.get("usage", {}) if isinstance(response_json.get("usage"), dict) else {}
             text_artifact = registry.import_file(
                 text_path, kind="text", role="text_output", media_type="text/plain", job_id=job["id"],
-                metadata={"model": response_json.get("model", self.model), "sourceArtifactId": artifact["id"]},
+                metadata={"model": self.model, "sourceArtifactId": artifact["id"]},
                 validation={"schema": "openai.chat.completion.v1", "finishReason": choice.get("finish_reason"), "usage": usage, "valid": True},
             )
             response_artifact = registry.import_file(
                 json_path, kind="report", role="provider_response", media_type="application/json", job_id=job["id"],
-                metadata={"model": response_json.get("model", self.model), "textArtifactId": text_artifact["id"]},
+                metadata={"model": self.model, "textArtifactId": text_artifact["id"]},
                 validation={"schema": "openai.chat.completion.v1", "valid": True},
             )
-            return {"artifacts": [text_artifact, response_artifact], "continuations": [], "data": {"primaryArtifactId": text_artifact["id"], "model": response_json.get("model", self.model), "usage": usage}}
+            return {"artifacts": [text_artifact, response_artifact], "continuations": [], "data": {"primaryArtifactId": text_artifact["id"], "model": self.model, "usage": usage}}
         finally:
             text_path.unlink(missing_ok=True)
             json_path.unlink(missing_ok=True)
@@ -971,9 +1038,10 @@ class OpenAIRoute:
     estimated_memory_gb: int
     priority: int
     service_classes: tuple[str, ...]
+    config_revision: str | None = None
 
     def public(self) -> dict[str, Any]:
-        return {
+        value = {
             "id": self.id,
             "model": self.model,
             "profileId": self.profile_id,
@@ -982,65 +1050,47 @@ class OpenAIRoute:
             "priority": self.priority,
             "serviceClasses": list(self.service_classes),
         }
+        if self.config_revision is not None:
+            value["configRevision"] = self.config_revision
+        return value
 
 
 def load_openai_routes(path: Path) -> tuple[OpenAIRoute, ...]:
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict) or value.get("version") != 1 or set(value) != {"version", "routes"}:
-        raise ValueError("OpenAI routes file must contain exactly version=1 and routes")
-    routes = value["routes"]
-    if not isinstance(routes, list) or not routes or len(routes) > 32:
-        raise ValueError("OpenAI routes must contain 1-32 entries")
+    try:
+        value = json.loads(read_owner_text(path, "OpenAI routes", maximum_bytes=1024 * 1024))
+    except SecureFileError as exc:
+        raise ValueError(str(exc)) from exc
+    try:
+        compiled = compile_routing_config(value)
+    except RoutingError as exc:
+        raise ValueError(str(exc)) from exc
+    raw_by_id = {item["id"]: item for item in value["routes"]}
     result: list[OpenAIRoute] = []
-    allowed = {
-        "id", "model", "profileId", "description", "endpoint", "apiKeyFile",
-        "container", "estimatedMemoryGb", "priority", "serviceClasses",
-    }
-    for item in routes:
-        if not isinstance(item, dict) or set(item) - allowed:
-            raise ValueError("OpenAI route contains unknown fields")
-        route_id = item.get("id")
-        if not isinstance(route_id, str) or not re.fullmatch(r"[a-z][a-z0-9]*(?:[._-][a-z0-9]+){0,7}", route_id):
-            raise ValueError("OpenAI route id is invalid")
-        model = item.get("model")
-        if not isinstance(model, str) or not model or len(model) > 256:
-            raise ValueError("OpenAI route model is invalid")
-        key_file = item.get("apiKeyFile")
-        if not isinstance(key_file, str) or not key_file.startswith("/"):
-            raise ValueError("OpenAI route apiKeyFile must be absolute")
+    for route in compiled.routes:
+        item = raw_by_id[route.id]
+        key_file = item["apiKeyFile"]
         key_path = Path(key_file)
-        key_stat = key_path.stat()
-        if key_stat.st_uid != os.geteuid() or key_stat.st_mode & 0o077:
-            raise ValueError("OpenAI route credential must be owner-readable only")
-        api_key = key_path.read_text(encoding="utf-8").strip()
-        if len(api_key) < 8:
-            raise ValueError("OpenAI route credential is missing or too short")
-        endpoint = item.get("endpoint")
-        parsed = urllib.parse.urlsplit(endpoint) if isinstance(endpoint, str) else None
-        if parsed is None or parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"} or parsed.username or parsed.password or parsed.query or parsed.fragment:
-            raise ValueError("OpenAI route endpoint must be an HTTP loopback URL")
-        service_classes = item.get("serviceClasses", ["interactive", "batch"])
-        if not isinstance(service_classes, list) or not service_classes or any(value not in {"interactive", "batch", "background"} for value in service_classes):
-            raise ValueError("OpenAI route serviceClasses is invalid")
-        priority = item.get("priority", 50)
-        if not isinstance(priority, int) or isinstance(priority, bool) or not 0 <= priority <= 100:
-            raise ValueError("OpenAI route priority must be 0-100")
+        try:
+            api_key = read_owner_secret(
+                key_path,
+                "OpenAI route credential",
+                minimum_length=8,
+            )
+        except SecureFileError as exc:
+            raise ValueError(str(exc)) from exc
         result.append(OpenAIRoute(
-            id=route_id,
-            model=model,
-            profile_id=item.get("profileId", f"gpu.{route_id}"),
-            description=item.get("description", f"Local model route {route_id}"),
-            endpoint=endpoint,
+            id=route.id,
+            model=route.model,
+            profile_id=route.profile_id,
+            description=item.get("description", f"Local model route {route.id}").strip(),
+            endpoint=item["endpoint"].rstrip("/"),
             api_key=api_key,
             container_name=item.get("container"),
-            estimated_memory_gb=item.get("estimatedMemoryGb", 0),
-            priority=priority,
-            service_classes=tuple(dict.fromkeys(service_classes)),
+            estimated_memory_gb=route.estimated_memory_gb,
+            priority=route.priority,
+            service_classes=route.service_classes,
+            config_revision=compiled.revision,
         ))
-    if len({item.id for item in result}) != len(result):
-        raise ValueError("OpenAI route ids must be unique")
-    if len({item.profile_id for item in result}) != len(result):
-        raise ValueError("OpenAI route profile ids must be unique")
     return tuple(result)
 
 
@@ -1049,6 +1099,26 @@ class RoutedOpenAIChatExecutor(Executor):
         if not routes:
             raise ValueError("at least one inference route is required")
         self.routes = routes
+        declared_revisions = {route.config_revision for route in routes if route.config_revision is not None}
+        if declared_revisions and (
+            len(declared_revisions) != 1 or any(route.config_revision is None for route in routes)
+        ):
+            raise ValueError("inference routes must share one compiled configuration revision")
+        self.installed_config_revision = next(iter(declared_revisions), None)
+        try:
+            self.routing_config = compile_route_policies(
+                ({
+                    "id": route.id,
+                    "model": route.model,
+                    "profileId": route.profile_id,
+                    "estimatedMemoryGb": route.estimated_memory_gb,
+                    "priority": route.priority,
+                    "serviceClasses": list(route.service_classes),
+                } for route in routes),
+            )
+        except RoutingError as exc:
+            raise ValueError(str(exc)) from exc
+        self.routing_engine = self.routing_config.engine()
         self.backends = {
             route.id: OpenAIChatExecutor(
                 endpoint=route.endpoint,
@@ -1086,6 +1156,12 @@ class RoutedOpenAIChatExecutor(Executor):
     def has_managed_unload(self) -> bool:
         return all(backend.has_managed_unload() for backend in self.backends.values())
 
+    def gpu_profile_lifecycles(self) -> dict[str, bool]:
+        return {
+            route.profile_id: self.backends[route.id].has_managed_unload()
+            for route in self.routes
+        }
+
     def validate_request(self, job: dict[str, Any], registry: ArtifactRegistry) -> None:
         plan = self.plan(job)
         self.backends[plan.route_id or ""].validate_request(self._delegate_job(job), registry)
@@ -1105,38 +1181,23 @@ class RoutedOpenAIChatExecutor(Executor):
         preference = constraints.get("routePreference", "balanced")
         if preference not in {"balanced", "latency", "throughput", "memory"}:
             raise ContractError("invalid_constraint", "routePreference is invalid", field="constraints.routePreference")
-        candidates = [
-            route for route in self.routes
-            if (model is None or route.model == model) and service_class in route.service_classes
-        ]
-        if not candidates:
-            raise ContractError("route_unavailable", "no installed inference profile satisfies the request", field="constraints")
-        context = routing_context or {}
-        profiles = context.get("profiles", {}) if isinstance(context.get("profiles", {}), dict) else {}
-        candidates = [
-            route for route in candidates
-            if not isinstance(profiles.get(route.profile_id), dict) or profiles[route.profile_id].get("health") != "unhealthy"
-        ]
-        if not candidates:
-            raise ContractError("route_unavailable", "all matching inference profiles are unhealthy", field="constraints")
-        active_profiles = set(context.get("activeProfiles", [])) if isinstance(context.get("activeProfiles", []), list) else set()
-        if preference == "memory":
-            candidates.sort(key=lambda item: (item.estimated_memory_gb, -item.priority, item.id))
-        elif preference == "latency":
-            candidates.sort(key=lambda item: (
-                float(profiles.get(item.profile_id, {}).get("latencyMs", float("inf"))) if isinstance(profiles.get(item.profile_id), dict) else float("inf"),
-                -item.priority,
-                item.id,
-            ))
-        elif preference == "throughput":
-            candidates.sort(key=lambda item: (
-                -float(profiles.get(item.profile_id, {}).get("availableConcurrency", 0)) if isinstance(profiles.get(item.profile_id), dict) else 0,
-                -item.priority,
-                item.id,
-            ))
-        else:
-            candidates.sort(key=lambda item: (item.profile_id not in active_profiles, -item.priority, item.estimated_memory_gb, item.id))
-        selected = candidates[0]
+        try:
+            decision = self.routing_engine.decide(
+                model=model,
+                service_class=service_class,
+                preference=preference,
+                snapshot=routing_context,
+            )
+        except RoutingError as exc:
+            field = "constraints"
+            if exc.field == "model":
+                field = "constraints.model"
+            elif exc.field == "serviceClass":
+                field = "constraints.serviceClass"
+            elif exc.field == "routePreference":
+                field = "constraints.routePreference"
+            raise ContractError(exc.code, str(exc), field=field) from exc
+        selected = next(route for route in self.routes if route.id == decision.route_id)
         return ExecutionPlan(
             profile_id=selected.profile_id,
             route_id=selected.id,
@@ -1144,7 +1205,7 @@ class RoutedOpenAIChatExecutor(Executor):
             service_class=service_class,
             lease_mode="permit",
             estimated_memory_gb=selected.estimated_memory_gb,
-            route_reason="explicit_model" if model is not None else f"policy:{preference}",
+            route_reason=decision.reason,
             verify_profile_active=True,
         )
 

@@ -27,22 +27,27 @@ mode-restricted environment file. See [ARCHITECTURE.md](ARCHITECTURE.md).
 
 - Protocol 1.0 asynchronous jobs with trace routes and idempotency keys.
 - Typed artifact upload, metadata, SHA-256 verification, byte-range download,
-  atomic staging, and bounded storage operations.
+  atomic staging, cached immutable-object verification, recoverable orphan
+  quarantine, and bounded storage operations.
 - An OS-locked, epoch-fenced host coordinator with durable GPU leases,
   fail-closed restart reconciliation, unified-memory admission hooks, and
   acknowledged lifecycle controls.
+- An optional authenticated, read-only resource probe that binds CUDA PIDs to
+  pinned Docker images or systemd user-unit executables and fails closed on
+  unknown consumers. See [Resource probe](docs/RESOURCE-PROBE.md).
 - Multi-profile inference routing by advertised model identity, service class,
   administrator priority, measured health, residency, or memory preference.
-- A scheduling control loop that continues observing higher-priority work while
-  a cooperative long-running adapter executes.
 - Dynamic capability discovery. Unconfigured adapters are absent.
 - A generic OpenAI-compatible text adapter with a configurable model, profile
   identity, memory estimate, endpoint, and optional Docker container.
 - An optional Hunyuan3D adapter with typed GLB/report output and an optional
   Blender preparation continuation. The broker reports the continuation but
-  never launches Blender.
+  never launches Blender. Its current job-scoped container is eligible only as
+  a single isolated GPU profile; multi-profile or controller-backed rotation is
+  refused until activation can be observed through the resource probe.
 - `sparkctl`, an optional standalone `spark-mcp` server, systemd units, and a
-  user-level installer.
+  staged user-level installer with an online SQLite backup, atomic release
+  pointer, authenticated readiness/version gate, and automatic rollback.
 
 The default installation exposes only `system.echo`. No model family,
 container, workload path, hostname, or remote network is assumed.
@@ -51,7 +56,9 @@ Managed resumable training is intentionally not advertised in this release.
 Protocol 1.0 cannot truthfully represent a yielded training run, so the broker
 fails such a yield instead of reporting false completion. The resource
 coordinator can already ask an administrator-installed governor to throttle or
-checkpoint-and-release before an inference call. A first-class training
+checkpoint-and-release before an inference call, enforces a durable minimum
+training quantum between displacements, and bounds the inference window before
+the trainer resumes. A first-class training
 capability requires the protocol and checkpoint work described in
 [Training integration](docs/TRAINING-INTEGRATION.md).
 
@@ -64,7 +71,20 @@ capability requires the protocol and checkpoint work described in
 
 ## Install
 
-Clone the repository on the inference host and run:
+On a host that already has a broker, gateway, trainer, or other GPU workload,
+start with the isolated CPU-only canary. It uses port `8792`, a separate token,
+state directory, release pointer, and systemd unit, and does not install any GPU
+capability:
+
+```bash
+./deploy-canary-user.sh
+systemctl --user status go7-spark-broker-canary
+```
+
+`deploy-user.sh` is an intentional production installation or cutover: it
+updates the production unit and restarts `go7-spark-broker` on its configured
+port. Use it only for a new production installation or after the staged rollout
+gates have passed:
 
 ```bash
 ./deploy-user.sh
@@ -126,6 +146,13 @@ rejects temporary and per-user runtime locations. Provision the paths for one
 dedicated service account; do not grant independent user services direct GPU
 mutation authority.
 
+Use the [staged rollout and rollback gates](docs/STAGED-ROLLOUT.md) for every
+upgrade. The first parallel canary is deliberately CPU-only; it validates the
+package, protocol, CLI/MCP, and artifact paths without touching live GPU work.
+`./deploy-canary-user.sh` installs that canary into versioned release
+directories, keeps separate state and credentials, checks readiness, and
+restores the previous canary release if the health gate fails.
+
 `deploy-user.sh` supplies the token and data paths when they are omitted from
 an imported configuration. With the shipped user service, keep data beneath
 `~/.local/share/go7-spark-broker/` and writable workloads beneath that directory
@@ -159,7 +186,8 @@ outside the checkout and configure:
 SPARK_OPENAI_ROUTES_FILE=/absolute/path/to/inference-routes.json
 ```
 
-The routes file is administrator-owned. It contains loopback model endpoints,
+The routes file is service-account-owned, regular, non-symlink, and mode
+`0600` or stricter. It contains loopback model endpoints,
 literal container names, model identities, resource envelopes, and
 credential-file paths. Callers may select an advertised model identity or a
 service class; they can never supply an endpoint, container, executable, or
@@ -174,8 +202,12 @@ outside the checkout and configure:
 SPARK_RESOURCE_POLICY_FILE=/absolute/path/to/resource-policy.json
 ```
 
+The resource policy and every referenced bearer credential are also
+service-account-owned, regular, non-symlink files with mode `0600` or stricter.
+
 The governor contract uses a broker lease ID, explicit durable broker epoch,
-fence, control generation, and a shared causal snapshot generation. Training
+fence, control generation, random mutation identity, and probe-observed
+controller state. Training
 controllers must prove a durable checkpoint boundary. The broker re-reads the
 resource snapshot after control and activation, unloads the selected model
 before restoring displaced work, and refuses incompatible coexistence. See
@@ -217,6 +249,8 @@ export SPARK_BROKER_TOKEN_FILE=/absolute/path/to/broker-token-copy
 
 sparkctl capabilities
 sparkctl status
+sparkctl route-validate /absolute/path/to/inference-routes.json
+sparkctl route-simulate /absolute/path/to/routing-scenario.json
 sparkctl chat 'Return exactly ROUTER_OK' --wait --print-output
 sparkctl chat 'Summarize this' --model your-small-model-id --service-class interactive --wait
 sparkctl upload source.png --kind image --role source_image --media-type image/png
@@ -231,13 +265,22 @@ sparkctl cancel JOB_ID
 `sparkctl submit request.json` accepts a complete versioned request, so new
 capabilities do not require a new CLI command.
 
+`route-validate` and `route-simulate` are offline operations. They do not need a
+broker token, contact a model runtime, or mutate broker state. Validation emits
+the canonical SHA-256 routing revision. Simulation evaluates deterministic
+request and resource-snapshot cases against the same pure decision engine used
+by the production executor; see `tests/scenarios/routing-basic.json` for the
+strict version 1 scenario shape.
+
 ## MCP
 
 `spark-mcp` is an optional direct client adapter. It uses the same URL and
 token-file environment and exposes discovery, generic submit, convenience
 text/3D calls, model and service-class routing, status, events, cancellation,
 and chunked artifact transfer. Full downloads are verified against the
-registered artifact digest.
+registered artifact digest. The model-specific `spark_chat` and
+`spark_generate_3d` tools appear only when the broker advertises those installed
+capabilities; a CPU-only broker does not claim them.
 
 CLI file uploads are bounded to 256 MiB to avoid reading multi-gigabyte files
 into client memory. Larger assets need an administrator-installed staged
@@ -265,5 +308,10 @@ account per trust boundary. Files
 under `~/.config/go7-spark-broker`, runtime data, model checkpoints, generated
 artifacts, and machine-specific systemd overrides never belong in this
 repository. The checked-in configuration contains placeholders only.
+
+Crash-staged or database-unregistered bytes are moved beneath the broker data
+directory's `.orphaned` tree rather than deleted. They are never addressable
+through the API and do not count toward registered-artifact quota; operators
+should inspect and archive or remove them under their storage-retention policy.
 
 Licensed under the [MIT License](LICENSE).

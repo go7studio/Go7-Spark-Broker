@@ -1,0 +1,35 @@
+[Unit]
+Description=Go7 Spark read-only resource probe for %i
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+RuntimeDirectory=go7-spark-resource-probe
+RuntimeDirectoryMode=0700
+StateDirectory=go7-spark-resource-probe/%i
+StateDirectoryMode=0700
+Environment=SPARK_RESOURCE_PROBE_BIND=127.0.0.1
+Environment=SPARK_RESOURCE_PROBE_PORT=8791
+Environment=SPARK_RESOURCE_PROBE_CONFIG=/etc/go7-spark-resource-probe/%i.json
+Environment=SPARK_RESOURCE_PROBE_TOKEN_FILE=/etc/go7-spark-resource-probe/%i.token
+Environment=SPARK_RESOURCE_PROBE_GENERATION_FILE=/var/lib/go7-spark-resource-probe/%i/generation
+ExecStart=/opt/go7-spark-broker/venv/bin/spark-resource-probe
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+# The probe needs read-only access to /run/user/UID for the user manager bus
+# and an optional rootless Docker socket. It never writes model or home data.
+ProtectHome=read-only
+ReadWritePaths=/var/lib/go7-spark-resource-probe/%i
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

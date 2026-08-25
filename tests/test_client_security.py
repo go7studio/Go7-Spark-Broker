@@ -37,6 +37,19 @@ class CredentialSinkHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"{}")
 
 
+class MissingDigestHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_GET(self):
+        body = b"unattested"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
 class ClientSecurityTests(unittest.TestCase):
     def test_remote_plaintext_and_url_credentials_are_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "HTTPS"):
@@ -71,6 +84,20 @@ class ClientSecurityTests(unittest.TestCase):
             sink.server_close()
             for thread in threads:
                 thread.join(5)
+
+    def test_artifact_download_requires_server_integrity_digest(self) -> None:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), MissingDigestHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            client = BrokerClient(f"http://127.0.0.1:{server.server_address[1]}", "t" * 32)
+            with self.assertRaises(ClientError) as context:
+                client.download_bytes("art_test")
+            self.assertEqual(context.exception.code, "missing_integrity")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(5)
 
 
 if __name__ == "__main__":

@@ -1,21 +1,21 @@
 [Unit]
-Description=Go7 Spark Capability Broker
+Description=Go7 Spark Capability Broker CPU-only canary
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-RuntimeDirectory=go7-spark-broker
+RuntimeDirectory=go7-spark-broker-canary
 RuntimeDirectoryMode=0700
-EnvironmentFile=%h/.config/go7-spark-broker/env
-ExecStart=%h/.local/share/go7-spark-broker/current/venv/bin/spark-broker
+EnvironmentFile=%h/.config/go7-spark-broker-canary/env
+ExecStart=%h/.local/share/go7-spark-broker-canary/current/venv/bin/spark-broker
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.local/share/go7-spark-broker -%h/workloads
+ReadWritePaths=%h/.local/share/go7-spark-broker-canary
 RestrictSUIDSGID=true
 LockPersonality=true
 UMask=0077

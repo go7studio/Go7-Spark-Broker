@@ -30,6 +30,7 @@ Issues = "https://github.com/go7studio/Go7-Spark-Broker/issues"
 spark-broker = "spark_broker.server:main"
 sparkctl = "spark_broker.cli:main"
 spark-mcp = "spark_broker.mcp_server:main"
+spark-resource-probe = "spark_broker.resource_probe:main"
 
 [tool.setuptools]
 packages = ["spark_broker"]

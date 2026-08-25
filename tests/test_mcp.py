@@ -9,7 +9,7 @@ import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-from spark_broker.mcp_server import call_tool
+from spark_broker.mcp_server import call_tool, tools_for_capabilities
 from spark_broker.server import Broker, BrokerHTTPServer, Config
 from tests.helpers import HealthyHostProbe, write_resource_policy
 from tests.test_executors import FakeTextHandler
@@ -102,6 +102,29 @@ class MCPFlowTests(unittest.TestCase):
         self.assertEqual(bytes(received), glb)
         self.assertEqual(chunk["artifactSha256"], uploaded["sha256"])
         self.assertTrue(chunk["eof"])
+
+    def test_mcp_shortcuts_follow_installed_capabilities(self) -> None:
+        cpu_tools = {
+            item["name"] for item in tools_for_capabilities({
+                "capabilities": [{"id": "system.echo", "available": True}],
+            })
+        }
+        self.assertNotIn("spark_chat", cpu_tools)
+        self.assertNotIn("spark_generate_3d", cpu_tools)
+        self.assertIn("spark_submit_job", cpu_tools)
+        model_tools = {
+            item["name"] for item in tools_for_capabilities({
+                "capabilities": [
+                    {"id": "system.echo", "available": True},
+                    {"id": "text.chat.generate", "available": False},
+                    {"id": "asset.3d.generate", "available": True},
+                ],
+            })
+        }
+        self.assertIn("spark_chat", model_tools)
+        self.assertIn("spark_generate_3d", model_tools)
+        unavailable = [item["name"] for item in tools_for_capabilities(None)]
+        self.assertEqual(unavailable, ["spark_capabilities"])
 
 
 if __name__ == "__main__":

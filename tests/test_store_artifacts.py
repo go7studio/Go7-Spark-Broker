@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from spark_broker.artifacts import ArtifactError, ArtifactRegistry
 from spark_broker.contract import validate_job_request
@@ -75,6 +77,110 @@ class StoreArtifactTests(unittest.TestCase):
         count = self.store._connection().execute("SELECT COUNT(*) FROM artifacts").fetchone()[0]
         self.assertEqual(count, 0)
         self.assertEqual(list((self.root / "artifacts" / ".staging").iterdir()), [])
+
+    def test_result_file_hash_and_regular_file_are_bound_before_registration(self) -> None:
+        source = self.root / "result.glb"
+        source.write_bytes(b"glTFresult")
+        with self.assertRaisesRegex(ArtifactError, "changed after validation"):
+            self.registry.import_file(
+                source,
+                kind="model3d",
+                role="shape_model",
+                media_type="model/gltf-binary",
+                job_id=None,
+                expected_sha256="0" * 64,
+            )
+        link = self.root / "result-link.glb"
+        link.symlink_to(source)
+        with self.assertRaisesRegex(ArtifactError, "opened safely"):
+            self.registry.import_file(
+                link,
+                kind="model3d",
+                role="shape_model",
+                media_type="model/gltf-binary",
+                job_id=None,
+            )
+        self.assertEqual(self.store.artifact_usage_bytes(), 0)
+
+    def test_result_import_rejects_a_source_that_changes_while_copying(self) -> None:
+        source = self.root / "changing-result.bin"
+        source.write_bytes(b"a" * (512 * 1024))
+        original_fdopen = os.fdopen
+        changed = False
+
+        class ChangingReader:
+            def __init__(self, wrapped):
+                self.wrapped = wrapped
+
+            def __enter__(self):
+                self.wrapped.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.wrapped.__exit__(*args)
+
+            def read(self, size=-1):
+                nonlocal changed
+                value = self.wrapped.read(size)
+                if value and not changed:
+                    changed = True
+                    with source.open("ab") as stream:
+                        stream.write(b"changed")
+                return value
+
+            def fileno(self):
+                return self.wrapped.fileno()
+
+        def changing_fdopen(descriptor, mode, *args, **kwargs):
+            stream = original_fdopen(descriptor, mode, *args, **kwargs)
+            return ChangingReader(stream) if mode == "rb" else stream
+
+        with mock.patch("spark_broker.artifacts.os.fdopen", side_effect=changing_fdopen):
+            with self.assertRaisesRegex(ArtifactError, "changed during import"):
+                self.registry.import_file(
+                    source,
+                    kind="report",
+                    role="execution_log",
+                    media_type="text/plain",
+                    job_id=None,
+                )
+        self.assertEqual(self.store.artifact_usage_bytes(), 0)
+
+    def test_startup_cleanup_reclaims_unregistered_object_files(self) -> None:
+        orphan = self.root / "artifacts" / "objects" / "aa" / "orphan"
+        orphan.parent.mkdir(parents=True)
+        orphan.write_bytes(b"orphaned-before-db-commit")
+        registered = self.registry.import_stream(
+            io.BytesIO(b"registered"),
+            size=len(b"registered"),
+            kind="text",
+            role="output",
+            media_type="text/plain",
+        )
+
+        self.registry.clean_staging()
+
+        self.assertFalse(orphan.exists())
+        quarantined = self.root / "artifacts" / ".orphaned" / "objects" / "aa" / "orphan"
+        self.assertEqual(quarantined.read_bytes(), b"orphaned-before-db-commit")
+        _metadata, registered_path = self.registry.resolve(registered["id"], verify=True)
+        self.assertTrue(registered_path.exists())
+
+    def test_verified_immutable_artifact_is_not_rehashed_for_every_chunk(self) -> None:
+        payload = b"large-model-bytes" * 1000
+        artifact = self.registry.import_stream(
+            io.BytesIO(payload), size=len(payload), kind="model3d", role="model",
+            media_type="model/gltf-binary",
+        )
+        restarted = ArtifactRegistry(
+            self.root / "artifacts", self.store, max_upload_bytes=1024 * 1024,
+        )
+        with mock.patch("spark_broker.artifacts.os.read", wraps=os.read) as reader:
+            restarted.resolve(artifact["id"], verify=True)
+            first_count = reader.call_count
+            restarted.resolve(artifact["id"], verify=True)
+        self.assertGreater(first_count, 0)
+        self.assertEqual(reader.call_count, first_count)
 
     def test_aggregate_artifact_quota_fails_before_registration(self) -> None:
         registry = ArtifactRegistry(

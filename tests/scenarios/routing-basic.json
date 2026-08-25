@@ -1,0 +1,98 @@
+{
+  "version": 1,
+  "config": {
+    "version": 1,
+    "routes": [
+      {
+        "id": "small-interactive",
+        "model": "small-model",
+        "profileId": "gpu.small-interactive",
+        "description": "Low-latency route",
+        "endpoint": "http://127.0.0.1:8001",
+        "apiKeyFile": "/run/secrets/small-key",
+        "container": "small-runtime",
+        "estimatedMemoryGb": 24,
+        "priority": 90,
+        "serviceClasses": ["interactive", "batch"]
+      },
+      {
+        "id": "large-quality",
+        "model": "large-model",
+        "profileId": "gpu.large-quality",
+        "description": "High-quality route",
+        "endpoint": "http://127.0.0.1:8002",
+        "apiKeyFile": "/run/secrets/large-key",
+        "container": "large-runtime",
+        "estimatedMemoryGb": 72,
+        "priority": 60,
+        "serviceClasses": ["interactive", "batch", "background"]
+      }
+    ]
+  },
+  "cases": [
+    {
+      "id": "balanced-admin-priority",
+      "request": {},
+      "snapshot": {"activeProfiles": [], "profiles": {}}
+    },
+    {
+      "id": "balanced-resident",
+      "request": {"routePreference": "balanced"},
+      "snapshot": {
+        "activeProfiles": ["gpu.large-quality"],
+        "profiles": {
+          "gpu.small-interactive": {"health": "healthy"},
+          "gpu.large-quality": {"health": "healthy"}
+        }
+      }
+    },
+    {
+      "id": "latency-metric",
+      "request": {"routePreference": "latency"},
+      "snapshot": {
+        "activeProfiles": [],
+        "profiles": {
+          "gpu.small-interactive": {"health": "healthy", "latencyMs": 120},
+          "gpu.large-quality": {"health": "healthy", "latencyMs": 40}
+        }
+      }
+    },
+    {
+      "id": "throughput-metric",
+      "request": {"routePreference": "throughput"},
+      "snapshot": {
+        "activeProfiles": [],
+        "profiles": {
+          "gpu.small-interactive": {"availableConcurrency": 2},
+          "gpu.large-quality": {"availableConcurrency": 8}
+        }
+      }
+    },
+    {
+      "id": "memory-envelope",
+      "request": {"routePreference": "memory"},
+      "snapshot": {"activeProfiles": [], "profiles": {}}
+    },
+    {
+      "id": "explicit-background-model",
+      "request": {"model": "large-model", "serviceClass": "background"},
+      "snapshot": {"activeProfiles": [], "profiles": {}}
+    },
+    {
+      "id": "unhealthy-fallback",
+      "request": {},
+      "snapshot": {
+        "activeProfiles": [],
+        "profiles": {"gpu.small-interactive": {"health": "unhealthy"}}
+      }
+    },
+    {
+      "id": "malformed-latency-rejected",
+      "request": {"routePreference": "latency"},
+      "snapshot": {
+        "activeProfiles": [],
+        "profiles": {"gpu.small-interactive": {"latencyMs": "fast"}}
+      }
+    }
+  ]
+}

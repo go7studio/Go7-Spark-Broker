@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import re
 import socket
@@ -13,9 +14,11 @@ import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from .secure_files import SecureFileError, read_owner_secret, read_owner_text
 from .store import Store
 
 
@@ -81,9 +84,23 @@ class ExecutionControl:
         self._yield_requested = threading.Event()
         self._yield_lock = threading.Lock()
         self._yield_reason: str | None = None
+        self._deadline_monotonic: float | None = None
 
     def __call__(self) -> bool:
-        return self._cancelled()
+        deadline = self._deadline_monotonic
+        return self._cancelled() or (deadline is not None and time.monotonic() >= deadline)
+
+    def set_execution_window(self, seconds: float) -> None:
+        if seconds <= 0:
+            raise ValueError("execution window must be positive")
+        self._deadline_monotonic = time.monotonic() + seconds
+
+    def bounded_timeout(self, requested_seconds: float) -> float:
+        """Cap a blocking operation to the remaining governed window."""
+        deadline = self._deadline_monotonic
+        if deadline is None:
+            return requested_seconds
+        return max(0.1, min(requested_seconds, deadline - time.monotonic()))
 
     def request_yield(self, reason: str) -> None:
         with self._yield_lock:
@@ -112,6 +129,8 @@ class ControllerPolicy:
     priority: int
     workload_kind: str = "background"
     requires_checkpoint: bool = False
+    timeout_seconds: float = 600.0
+    minimum_normal_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -124,15 +143,24 @@ class ResourcePolicy:
     probe_token_file: Path | None = None
     controllers: tuple[ControllerPolicy, ...] = ()
     shared_certifications: tuple[tuple[str, str], ...] = ()
+    maximum_inference_window_seconds: float | None = None
 
     @classmethod
     def from_file(cls, path: Path) -> "ResourcePolicy":
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            raw = json.loads(read_owner_text(path, "resource policy", maximum_bytes=1024 * 1024))
+        except SecureFileError as exc:
+            raise ValueError(str(exc)) from exc
+        return cls.from_value(raw)
+
+    @classmethod
+    def from_value(cls, raw: Any) -> "ResourcePolicy":
         if not isinstance(raw, dict) or raw.get("version") != 1:
             raise ValueError("resource policy must be a version 1 object")
         allowed = {
             "version", "hostReserveGb", "maximumMemoryPressureAvg10",
             "enforceMemoryAdmission", "probe", "controllers", "sharedCertifications",
+            "maximumInferenceWindowSeconds",
         }
         unknown = set(raw) - allowed
         if unknown:
@@ -146,6 +174,13 @@ class ResourcePolicy:
             raise ValueError("maximumMemoryPressureAvg10 must be 0-100")
         if not isinstance(enforce, bool):
             raise ValueError("enforceMemoryAdmission must be boolean")
+        maximum_window = raw.get("maximumInferenceWindowSeconds")
+        if maximum_window is not None and (
+            not isinstance(maximum_window, (int, float))
+            or isinstance(maximum_window, bool)
+            or not 10 <= maximum_window <= 3600
+        ):
+            raise ValueError("maximumInferenceWindowSeconds must be 10-3600")
 
         probe = raw.get("probe")
         probe_endpoint: str | None = None
@@ -170,6 +205,8 @@ class ResourcePolicy:
                 "normalMode", "throttledMode", "priority",
                 "requiresCheckpoint",
                 "workloadKind",
+                "timeoutSeconds",
+                "minimumNormalSeconds",
             }:
                 raise ValueError("controller contains unknown fields")
             controller_id = _identifier(item.get("id"), "controller.id")
@@ -188,6 +225,22 @@ class ResourcePolicy:
                 raise ValueError("controller.requiresCheckpoint must be boolean")
             if workload_kind == "training" and not requires_checkpoint:
                 raise ValueError("training controllers must require checkpoint proof")
+            timeout_seconds = item.get("timeoutSeconds", 600)
+            if (
+                not isinstance(timeout_seconds, (int, float))
+                or isinstance(timeout_seconds, bool)
+                or not 1 <= timeout_seconds <= 3600
+            ):
+                raise ValueError("controller.timeoutSeconds must be 1-3600")
+            minimum_normal_seconds = item.get("minimumNormalSeconds", 0)
+            if (
+                not isinstance(minimum_normal_seconds, (int, float))
+                or isinstance(minimum_normal_seconds, bool)
+                or not 0 <= minimum_normal_seconds <= 86400
+            ):
+                raise ValueError("controller.minimumNormalSeconds must be 0-86400")
+            if workload_kind == "training" and minimum_normal_seconds < 1:
+                raise ValueError("training controllers must set minimumNormalSeconds")
             controllers.append(ControllerPolicy(
                 id=controller_id,
                 profile_id=profile_id,
@@ -199,9 +252,13 @@ class ResourcePolicy:
                 priority=priority,
                 requires_checkpoint=requires_checkpoint,
                 workload_kind=workload_kind,
+                timeout_seconds=float(timeout_seconds),
+                minimum_normal_seconds=float(minimum_normal_seconds),
             ))
         if len({item.id for item in controllers}) != len(controllers):
             raise ValueError("controller ids must be unique")
+        if any(item.workload_kind == "training" for item in controllers) and maximum_window is None:
+            raise ValueError("training controllers require maximumInferenceWindowSeconds")
 
         certifications: list[tuple[str, str]] = []
         raw_certifications = raw.get("sharedCertifications", [])
@@ -228,6 +285,7 @@ class ResourcePolicy:
             probe_token_file=probe_token_file,
             controllers=tuple(controllers),
             shared_certifications=tuple(dict.fromkeys(certifications)),
+            maximum_inference_window_seconds=(float(maximum_window) if maximum_window is not None else None),
         )
 
 
@@ -295,22 +353,11 @@ class ResourceControlClient:
     @staticmethod
     def _token(path: Path) -> str:
         try:
-            stat = path.stat()
-            if stat.st_uid != os.geteuid() or stat.st_mode & 0o077:
-                raise AdmissionDeferred(
-                    "controller_credential_invalid",
-                    "resource controller credential must be owned by the service account and mode 0600 or stricter",
-                )
-            value = path.read_text(encoding="utf-8").strip()
-        except AdmissionDeferred:
-            raise
-        except OSError as exc:
+            return read_owner_secret(path, "resource controller credential")
+        except SecureFileError as exc:
             raise AdmissionDeferred(
                 "controller_credential_invalid", "resource controller credential cannot be read"
             ) from exc
-        if len(value) < 32:
-            raise AdmissionDeferred("controller_credential_invalid", "resource controller credential is missing or too short")
-        return value
 
     def snapshot(self, endpoint: str, token_file: Path) -> dict[str, Any]:
         return self._request("GET", f"{endpoint}/v1/resource-snapshot", token_file, None)
@@ -319,6 +366,7 @@ class ResourceControlClient:
         self,
         controller: ControllerPolicy,
         *,
+        mutation_id: str,
         mode: str,
         lease_id: str,
         fencing_token: str,
@@ -328,6 +376,7 @@ class ResourceControlClient:
     ) -> dict[str, Any]:
         payload = {
             "protocolVersion": "1.0",
+            "mutationId": mutation_id,
             "leaseId": lease_id,
             "fencingToken": fencing_token,
             "brokerEpoch": broker_epoch,
@@ -335,9 +384,13 @@ class ResourceControlClient:
             "targetMode": mode,
             "reason": reason,
         }
-        value = self._request("POST", f"{controller.endpoint}/v1/resource-mode", controller.token_file, payload)
+        value = self._request(
+            "POST", f"{controller.endpoint}/v1/resource-mode", controller.token_file, payload,
+            timeout=controller.timeout_seconds,
+        )
         if (
             value.get("leaseId") != lease_id
+            or value.get("mutationId") != mutation_id
             or value.get("fencingToken") != fencing_token
             or value.get("brokerEpoch") != broker_epoch
         ):
@@ -346,9 +399,6 @@ class ResourceControlClient:
             raise AdmissionDeferred("controller_ack_mismatch", f"controller {controller.id} did not acknowledge the requested generation")
         if value.get("health") != "healthy" or value.get("appliedAtSafeBoundary") is not True:
             raise AdmissionDeferred("controller_unhealthy", f"controller {controller.id} is not healthy")
-        snapshot_generation = value.get("snapshotGeneration")
-        if not isinstance(snapshot_generation, int) or isinstance(snapshot_generation, bool) or snapshot_generation < 0:
-            raise AdmissionDeferred("controller_ack_mismatch", f"controller {controller.id} omitted snapshot generation")
         if controller.requires_checkpoint and mode == controller.throttled_mode:
             checkpoint = value.get("checkpoint")
             if (
@@ -367,6 +417,7 @@ class ResourceControlClient:
         self,
         controller: ControllerPolicy,
         *,
+        mutation_id: str,
         previous_lease_id: str,
         previous_fencing_token: str,
         recovery_fencing_token: str,
@@ -376,6 +427,7 @@ class ResourceControlClient:
     ) -> dict[str, Any]:
         payload = {
             "protocolVersion": "1.0",
+            "mutationId": mutation_id,
             "previousLeaseId": previous_lease_id,
             "previousFencingToken": previous_fencing_token,
             "recoveryFencingToken": recovery_fencing_token,
@@ -384,9 +436,13 @@ class ResourceControlClient:
             "targetMode": mode,
             "reason": f"restart-recovery:{previous_lease_id}",
         }
-        value = self._request("POST", f"{controller.endpoint}/v1/resource-takeover", controller.token_file, payload)
+        value = self._request(
+            "POST", f"{controller.endpoint}/v1/resource-takeover", controller.token_file, payload,
+            timeout=controller.timeout_seconds,
+        )
         if (
-            value.get("previousLeaseId") != previous_lease_id
+            value.get("mutationId") != mutation_id
+            or value.get("previousLeaseId") != previous_lease_id
             or value.get("previousFencingToken") != previous_fencing_token
             or value.get("recoveryFencingToken") != recovery_fencing_token
             or value.get("brokerEpoch") != broker_epoch
@@ -394,12 +450,19 @@ class ResourceControlClient:
             or value.get("effectiveMode") != mode
             or value.get("health") != "healthy"
             or value.get("appliedAtSafeBoundary") is not True
-            or not isinstance(value.get("snapshotGeneration"), int)
         ):
             raise AdmissionDeferred("controller_takeover_mismatch", f"controller {controller.id} rejected recovery takeover")
         return value
 
-    def _request(self, method: str, url: str, token_file: Path, payload: dict[str, Any] | None) -> dict[str, Any]:
+    def _request(
+        self,
+        method: str,
+        url: str,
+        token_file: Path,
+        payload: dict[str, Any] | None,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
         data = None if payload is None else json.dumps(payload, separators=(",", ":")).encode("utf-8")
         request = urllib.request.Request(
             url,
@@ -408,7 +471,9 @@ class ResourceControlClient:
             headers={"Authorization": f"Bearer {self._token(token_file)}", "Content-Type": "application/json"},
         )
         try:
-            with self._opener.open(request, timeout=self.timeout) as response:
+            with self._opener.open(
+                request, timeout=self.timeout if timeout is None else timeout
+            ) as response:
                 if response.status != 200:
                     raise AdmissionDeferred("controller_http_error", f"resource controller returned HTTP {response.status}")
                 raw = response.read(1024 * 1024 + 1)
@@ -456,6 +521,8 @@ class ResourceCoordinator:
         self.epoch = 0
         self._lock_handle: Any = None
         self._quarantine_reason: str | None = None
+        self._probe_generation_lock = threading.Lock()
+        self._last_probe_generation = -1
 
     def start(self) -> None:
         lock_path = self.lock_path
@@ -505,7 +572,9 @@ class ResourceCoordinator:
                 continue
             if lease.get("throttle"):
                 try:
-                    expected_generation = self._recover_recorded_throttles(lease)
+                    expected_generation, restored_profiles = self._recover_recorded_throttles(
+                        lease, generation_floor=int(snapshot["probeGeneration"])
+                    )
                     restored = self._combined_snapshot()
                 except AdmissionDeferred as exc:
                     self._quarantine_reason = f"stale lease {lease['id']} recovery takeover failed: {exc.code}"
@@ -513,9 +582,19 @@ class ResourceCoordinator:
                 if not isinstance(restored.get("probeGeneration"), int) or restored["probeGeneration"] < expected_generation:
                     self._quarantine_reason = f"stale lease {lease['id']} recovery snapshot is stale"
                     continue
+                try:
+                    self._verify_restored_controllers(
+                        restored,
+                        expected_generation=expected_generation,
+                        restored_profiles=restored_profiles,
+                    )
+                except AdmissionDeferred as exc:
+                    self._quarantine_reason = f"stale lease {lease['id']} recovery restore failed: {exc.code}"
+                    continue
                 if not self._released_profile_is_verified(restored, lease["profileId"], requires_absence=True):
                     self._quarantine_reason = f"stale lease {lease['id']} restore could not be verified"
                     continue
+                self._mark_restored_quanta(restored_profiles)
             self.store.set_resource_lease_status(lease["id"], "released")
         self.store.interrupt_uncertain_jobs()
 
@@ -635,6 +714,8 @@ class ResourceCoordinator:
 
         snapshot = self._combined_snapshot()
         self._validate_snapshot(snapshot, plan, check_capacity=False)
+        controllers = self._controllers_for(plan)
+        self._enforce_training_quanta(controllers)
         decision = {"before": snapshot, "plan": plan.public(), "reason": plan.route_reason}
         lease = self.store.create_resource_lease(
             job_id=job["id"], broker_epoch=self.epoch, resource_group=plan.resource_group,
@@ -644,11 +725,14 @@ class ResourceCoordinator:
         )
         handle = LeaseHandle(lease=lease)
         try:
-            for generation, controller in enumerate(self._controllers_for(plan), start=1):
+            causal_generation = int(snapshot["probeGeneration"])
+            for generation, controller in enumerate(controllers, start=1):
+                mutation_id = f"mutation_{uuid.uuid4().hex}"
                 throttle_record = {
                     "controllerId": controller.id,
                     "normalMode": controller.normal_mode,
                     "generation": generation,
+                    "mutationId": mutation_id,
                     "state": "requested",
                 }
                 # Journal the compensating action before asking an external
@@ -661,6 +745,7 @@ class ResourceCoordinator:
                 )
                 acknowledgement = self.control_client.set_mode(
                     controller,
+                    mutation_id=mutation_id,
                     mode=controller.throttled_mode,
                     lease_id=lease["id"],
                     fencing_token=lease["fencingToken"],
@@ -668,21 +753,34 @@ class ResourceCoordinator:
                     generation=generation,
                     reason=f"admit:{plan.service_class}:{job['id']}",
                 )
+                observation = self._combined_snapshot()
+                observation_generation = int(observation["probeGeneration"])
+                if observation_generation <= causal_generation:
+                    raise AdmissionDeferred(
+                        "controller_observation_stale",
+                        f"controller {controller.id} mutation was not observed in a newer inventory",
+                    )
+                self._verify_controller_observation(
+                    observation,
+                    controller_id=controller.id,
+                    mutation_id=mutation_id,
+                    lease_id=lease["id"],
+                    fencing_token=lease["fencingToken"],
+                    broker_epoch=lease["brokerEpoch"],
+                    control_generation=generation,
+                    effective_mode=controller.throttled_mode,
+                    checkpoint=acknowledgement.get("checkpoint"),
+                )
+                causal_generation = observation_generation
                 throttle_record["state"] = "applied"
                 throttle_record["acknowledgement"] = acknowledgement
                 self.store.set_resource_lease_status(lease["id"], "acquiring", throttle=handle.throttled)
             after = self._combined_snapshot()
-            expected_generation = max(
-                (int(item["acknowledgement"]["snapshotGeneration"]) for item in handle.throttled),
-                default=None,
-            )
-            if expected_generation is not None:
-                observed_generation = after.get("probeGeneration")
-                if not isinstance(observed_generation, int) or observed_generation < expected_generation:
-                    raise AdmissionDeferred(
-                        "resource_snapshot_stale",
-                        "resource snapshot does not include the acknowledged controller generation",
-                    )
+            if int(after["probeGeneration"]) < causal_generation:
+                raise AdmissionDeferred(
+                    "resource_snapshot_stale",
+                    "resource snapshot moved behind the observed controller mutation",
+                )
             self._validate_snapshot(after, plan, check_capacity=True)
             self._validate_compatibility(after, plan)
             decision["afterThrottle"] = after
@@ -691,7 +789,28 @@ class ResourceCoordinator:
             return handle
         except BaseException:
             try:
-                self._restore_handle(handle)
+                if handle.throttled:
+                    before_restore = self._combined_snapshot()
+                    if not self._released_profile_is_verified(
+                        before_restore, handle.lease["profileId"], requires_absence=True
+                    ):
+                        raise AdmissionDeferred(
+                            "rollback_release_unverified",
+                            "selected inference profile is still active; refusing to restore displaced controllers",
+                        )
+                expected_generation, restored_profiles = self._restore_handle(
+                    handle,
+                    generation_floor=(
+                        int(before_restore["probeGeneration"]) if handle.throttled else None
+                    ),
+                )
+                restored = self._combined_snapshot()
+                self._verify_restored_controllers(
+                    restored,
+                    expected_generation=expected_generation,
+                    restored_profiles=restored_profiles,
+                )
+                self._mark_restored_quanta(restored_profiles)
             except Exception as restore_exc:
                 self.store.set_resource_lease_status(
                     lease["id"], "unknown", throttle=handle.throttled, decision=decision
@@ -724,13 +843,24 @@ class ResourceCoordinator:
                         "release_unverified",
                         "leased profile is still active; preserving background throttle state",
                     )
-            self._restore_handle(handle)
+            expected_generation, restored_profiles = self._restore_handle(
+                handle,
+                generation_floor=(
+                    int(before_restore["probeGeneration"]) if handle.throttled else None
+                ),
+            )
+            snapshot = self._combined_snapshot()
+            self._verify_restored_controllers(
+                snapshot,
+                expected_generation=expected_generation,
+                restored_profiles=restored_profiles,
+            )
             if requires_absence:
-                snapshot = self._combined_snapshot()
                 if not self._released_profile_is_verified(
                     snapshot, handle.lease["profileId"], requires_absence=True
                 ):
                     raise AdmissionDeferred("release_unverified", "exclusive runtime release was not verified")
+            self._mark_restored_quanta(restored_profiles)
         except Exception as exc:
             code = exc.code if isinstance(exc, AdmissionDeferred) else "controller_restore_failed"
             self.store.set_resource_lease_status(handle.lease["id"], "unknown", throttle=handle.throttled)
@@ -762,46 +892,211 @@ class ResourceCoordinator:
         ]
         return sorted(values, key=lambda item: (item.priority, item.id))
 
-    def _restore_handle(self, handle: LeaseHandle) -> None:
+    def configure_execution_control(self, plan: ExecutionPlan, control: ExecutionControl) -> None:
+        """Bound an inference window whenever training was displaced."""
+        training = [item for item in self._controllers_for(plan) if item.workload_kind == "training"]
+        if not training:
+            return
+        maximum = self.policy.maximum_inference_window_seconds
+        if maximum is None:
+            raise AdmissionDeferred(
+                "inference_window_required",
+                "training displacement requires a bounded inference window",
+            )
+        control.set_execution_window(maximum)
+
+    def _enforce_training_quanta(self, controllers: list[ControllerPolicy]) -> None:
+        now = datetime.now(timezone.utc)
+        for controller in controllers:
+            if controller.workload_kind != "training":
+                continue
+            raw = self.store.controller_normal_since(controller.id)
+            try:
+                since = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise AdmissionDeferred(
+                    "training_quantum_state_invalid",
+                    f"controller {controller.id} has invalid durable quantum state",
+                ) from exc
+            elapsed = (now - since).total_seconds()
+            remaining = controller.minimum_normal_seconds - elapsed
+            if remaining > 0:
+                raise AdmissionDeferred(
+                    "training_quantum_active",
+                    f"controller {controller.id} is inside its minimum uninterrupted training quantum",
+                    retry_after_seconds=max(0.1, remaining),
+                    detail={"controllerId": controller.id, "remainingSeconds": round(remaining, 3)},
+                )
+
+    def _mark_restored_quanta(self, restored_profiles: tuple[str, ...]) -> None:
+        restored = set(restored_profiles)
+        for controller in self.policy.controllers:
+            if controller.workload_kind == "training" and controller.profile_id in restored:
+                self.store.mark_controller_normal(controller.id)
+
+    def _restore_handle(
+        self, handle: LeaseHandle, *, generation_floor: int | None = None
+    ) -> tuple[int, tuple[str, ...]]:
         policies = {item.id: item for item in self.policy.controllers}
+        expected_generation = 0
+        causal_generation = generation_floor if generation_floor is not None else -1
+        restored_profiles: list[str] = []
         for item in reversed(handle.throttled):
             controller = policies.get(str(item["controllerId"]))
             if controller is None:
                 raise AdmissionDeferred("controller_missing", "recorded throttle controller is no longer configured")
-            self.control_client.set_mode(
+            mutation_id = f"mutation_{uuid.uuid4().hex}"
+            control_generation = int(item["generation"]) + 1_000_000
+            acknowledgement = self.control_client.set_mode(
                 controller,
+                mutation_id=mutation_id,
                 mode=str(item["normalMode"]),
                 lease_id=handle.lease["id"],
                 fencing_token=handle.lease["fencingToken"],
                 broker_epoch=handle.lease["brokerEpoch"],
-                generation=int(item["generation"]) + 1_000_000,
+                generation=control_generation,
                 reason=f"release:{handle.lease['jobId']}",
             )
+            observation = self._combined_snapshot()
+            observation_generation = int(observation["probeGeneration"])
+            if observation_generation <= causal_generation:
+                raise AdmissionDeferred(
+                    "controller_restore_stale",
+                    f"controller {controller.id} restoration was not observed in a newer inventory",
+                )
+            self._verify_controller_observation(
+                observation,
+                controller_id=controller.id,
+                mutation_id=mutation_id,
+                lease_id=handle.lease["id"],
+                fencing_token=handle.lease["fencingToken"],
+                broker_epoch=handle.lease["brokerEpoch"],
+                control_generation=control_generation,
+                effective_mode=str(item["normalMode"]),
+                checkpoint=acknowledgement.get("checkpoint"),
+            )
+            causal_generation = observation_generation
+            expected_generation = max(expected_generation, observation_generation)
+            restored_profiles.append(controller.profile_id)
+        return expected_generation, tuple(restored_profiles)
 
-    def _restore_recorded_throttles(self, lease: dict[str, Any]) -> None:
-        self._restore_handle(LeaseHandle(lease=lease, throttled=list(lease.get("throttle", []))))
+    def _restore_recorded_throttles(self, lease: dict[str, Any]) -> tuple[int, tuple[str, ...]]:
+        return self._restore_handle(LeaseHandle(lease=lease, throttled=list(lease.get("throttle", []))))
 
-    def _recover_recorded_throttles(self, lease: dict[str, Any]) -> int:
+    def _recover_recorded_throttles(
+        self, lease: dict[str, Any], *, generation_floor: int
+    ) -> tuple[int, tuple[str, ...]]:
         policies = {item.id: item for item in self.policy.controllers}
         recovery_fence = f"fence_{self.epoch}_recovery_{uuid.uuid4().hex}"
         expected_generation = 0
+        causal_generation = generation_floor
+        restored_profiles: list[str] = []
         for offset, item in enumerate(reversed(lease.get("throttle", [])), start=1):
             controller = policies.get(str(item["controllerId"]))
             if controller is None:
                 raise AdmissionDeferred("controller_missing", "recorded throttle controller is no longer configured")
+            mutation_id = f"mutation_{uuid.uuid4().hex}"
+            control_generation = 1_000_000 + offset
             acknowledgement = self.control_client.takeover_mode(
                 controller,
+                mutation_id=mutation_id,
                 previous_lease_id=lease["id"],
                 previous_fencing_token=lease["fencingToken"],
                 recovery_fencing_token=recovery_fence,
                 broker_epoch=self.epoch,
-                generation=1_000_000 + offset,
+                generation=control_generation,
                 mode=str(item["normalMode"]),
             )
-            expected_generation = max(expected_generation, int(acknowledgement["snapshotGeneration"]))
-        return expected_generation
+            observation = self._combined_snapshot()
+            observation_generation = int(observation["probeGeneration"])
+            if observation_generation <= causal_generation:
+                raise AdmissionDeferred(
+                    "controller_restore_stale",
+                    f"controller {controller.id} takeover was not observed in a newer inventory",
+                )
+            self._verify_controller_observation(
+                observation,
+                controller_id=controller.id,
+                mutation_id=mutation_id,
+                lease_id=lease["id"],
+                fencing_token=recovery_fence,
+                broker_epoch=self.epoch,
+                control_generation=control_generation,
+                effective_mode=str(item["normalMode"]),
+                checkpoint=acknowledgement.get("checkpoint"),
+            )
+            causal_generation = observation_generation
+            expected_generation = max(expected_generation, observation_generation)
+            restored_profiles.append(controller.profile_id)
+        return expected_generation, tuple(restored_profiles)
+
+    @staticmethod
+    def _verify_controller_observation(
+        snapshot: dict[str, Any], *, controller_id: str, mutation_id: str,
+        lease_id: str, fencing_token: str, broker_epoch: int,
+        control_generation: int, effective_mode: str,
+        checkpoint: dict[str, Any] | None,
+    ) -> None:
+        states = snapshot.get("controllerStates")
+        state = states.get(controller_id) if isinstance(states, dict) else None
+        if not isinstance(state, dict):
+            raise AdmissionDeferred(
+                "controller_observation_missing",
+                f"resource probe did not publish controller state {controller_id}",
+            )
+        expected = {
+            "mutationId": mutation_id,
+            "leaseId": lease_id,
+            "fencingToken": fencing_token,
+            "brokerEpoch": broker_epoch,
+            "controlGeneration": control_generation,
+            "effectiveMode": effective_mode,
+            "health": "healthy",
+            "appliedAtSafeBoundary": True,
+        }
+        if any(state.get(key) != value for key, value in expected.items()):
+            raise AdmissionDeferred(
+                "controller_observation_mismatch",
+                f"resource probe state for controller {controller_id} does not match the requested mutation",
+            )
+        if checkpoint is not None and state.get("checkpoint") != checkpoint:
+            raise AdmissionDeferred(
+                "controller_observation_mismatch",
+                f"resource probe state for controller {controller_id} does not match the checkpoint acknowledgement",
+            )
+
+    @staticmethod
+    def _verify_restored_controllers(
+        snapshot: dict[str, Any], *, expected_generation: int, restored_profiles: tuple[str, ...]
+    ) -> None:
+        observed_generation = snapshot.get("probeGeneration")
+        if (
+            not isinstance(observed_generation, int)
+            or isinstance(observed_generation, bool)
+            or observed_generation < expected_generation
+        ):
+            raise AdmissionDeferred(
+                "controller_restore_stale",
+                "resource snapshot does not include the acknowledged controller restoration",
+            )
+        active_profiles = snapshot.get("activeProfiles", [])
+        profiles = snapshot.get("profiles", {})
+        for profile_id in restored_profiles:
+            profile = profiles.get(profile_id)
+            if profile_id not in active_profiles or not isinstance(profile, dict) or profile.get("health") != "healthy":
+                raise AdmissionDeferred(
+                    "controller_restore_unverified",
+                    f"restored controller profile {profile_id} is not observably active and healthy",
+                )
 
     def _combined_snapshot(self) -> dict[str, Any]:
+        # Serialize remote samples. The probe assigns generations before it
+        # performs inventory, so two concurrent HTTP responses may legitimately
+        # arrive out of order even though the durable counter never regressed.
+        with self._probe_generation_lock:
+            return self._combined_snapshot_serialized()
+
+    def _combined_snapshot_serialized(self) -> dict[str, Any]:
         local = self.host_probe.snapshot()
         if not self.policy.probe_endpoint or not self.policy.probe_token_file:
             if self.policy.require_probe:
@@ -813,22 +1108,178 @@ class ResourceCoordinator:
             if self.policy.require_probe:
                 raise
             return {**local, "probeHealthy": False, "unknownConsumers": None, "activeProfiles": [], "profiles": {}}
-        active_profiles = remote.get("activeProfiles", [])
-        unknown = remote.get("unknownConsumers", 0)
-        if not isinstance(active_profiles, list) or any(not isinstance(item, str) for item in active_profiles):
+        required_fields = {
+            "health", "generation", "unknownConsumers", "activeProfiles", "profiles",
+            "controllerStates",
+        }
+        if not required_fields.issubset(remote):
+            missing = sorted(required_fields - set(remote))
+            raise AdmissionDeferred(
+                "resource_probe_invalid", f"resource probe omitted required fields: {missing}"
+            )
+        health = remote["health"]
+        if health not in {"healthy", "degraded", "unhealthy"}:
+            raise AdmissionDeferred("resource_probe_invalid", "resource probe health is invalid")
+        active_profiles = remote["activeProfiles"]
+        unknown = remote["unknownConsumers"]
+        if (
+            not isinstance(active_profiles, list)
+            or any(not isinstance(item, str) or not _IDENTIFIER.fullmatch(item) for item in active_profiles)
+            or len(active_profiles) != len(set(active_profiles))
+        ):
             raise AdmissionDeferred("resource_probe_invalid", "resource probe activeProfiles is invalid")
         if not isinstance(unknown, int) or isinstance(unknown, bool) or unknown < 0:
             raise AdmissionDeferred("resource_probe_invalid", "resource probe unknownConsumers is invalid")
-        profiles = remote.get("profiles", {})
-        if not isinstance(profiles, dict) or any(not isinstance(key, str) or not isinstance(value, dict) for key, value in profiles.items()):
+        profiles = remote["profiles"]
+        if not isinstance(profiles, dict) or any(
+            not isinstance(key, str) or not _IDENTIFIER.fullmatch(key) or not isinstance(value, dict)
+            for key, value in profiles.items()
+        ):
             raise AdmissionDeferred("resource_probe_invalid", "resource probe profiles is invalid")
+        active_healthy = True
+        for profile_id in active_profiles:
+            profile = profiles.get(profile_id)
+            if not isinstance(profile, dict):
+                raise AdmissionDeferred(
+                    "resource_probe_invalid", f"active profile {profile_id} has no inventory record"
+                )
+            runtime_identity = profile.get("runtimeIdentity")
+            owner_id = profile.get("ownerId")
+            if (
+                profile.get("identityVerified") is not True
+                or not isinstance(runtime_identity, str)
+                or not runtime_identity
+                or len(runtime_identity) > 512
+                or not isinstance(owner_id, str)
+                or not _IDENTIFIER.fullmatch(owner_id)
+            ):
+                raise AdmissionDeferred(
+                    "resource_probe_invalid", f"active profile {profile_id} lacks verified runtime ownership"
+                )
+            if profile.get("health") != "healthy":
+                active_healthy = False
+        for profile_id, profile in profiles.items():
+            latency = profile.get("latencyMs")
+            if latency is not None and (
+                not isinstance(latency, (int, float))
+                or isinstance(latency, bool)
+                or not math.isfinite(latency)
+                or latency < 0
+            ):
+                raise AdmissionDeferred(
+                    "resource_probe_invalid", f"profile {profile_id} latencyMs is invalid"
+                )
+            concurrency = profile.get("availableConcurrency")
+            if concurrency is not None and (
+                not isinstance(concurrency, int) or isinstance(concurrency, bool) or concurrency < 0
+            ):
+                raise AdmissionDeferred(
+                    "resource_probe_invalid", f"profile {profile_id} availableConcurrency is invalid"
+                )
+        controller_states = remote["controllerStates"]
+        if not isinstance(controller_states, dict) or any(
+            not isinstance(controller_id, str)
+            or not _IDENTIFIER.fullmatch(controller_id)
+            or not isinstance(state, dict)
+            for controller_id, state in controller_states.items()
+        ):
+            raise AdmissionDeferred(
+                "resource_probe_invalid", "resource probe controllerStates is invalid"
+            )
+        controller_required = {
+            "protocolVersion", "controllerId", "mutationId", "leaseId", "fencingToken",
+            "brokerEpoch", "controlGeneration", "effectiveMode", "health",
+            "appliedAtSafeBoundary",
+        }
+        for controller_id, state in controller_states.items():
+            if (
+                not controller_required.issubset(state)
+                or set(state) - (controller_required | {"checkpoint"})
+                or state.get("protocolVersion") != "1.0"
+                or state.get("controllerId") != controller_id
+                or not isinstance(state.get("mutationId"), str)
+                or not re.fullmatch(r"mutation_[a-f0-9]{32}", state["mutationId"])
+                or not isinstance(state.get("leaseId"), str)
+                or not re.fullmatch(r"lease_[a-f0-9]{32}", state["leaseId"])
+                or not isinstance(state.get("fencingToken"), str)
+                or not re.fullmatch(r"fence_[A-Za-z0-9_]{1,240}", state["fencingToken"])
+                or not isinstance(state.get("brokerEpoch"), int)
+                or isinstance(state.get("brokerEpoch"), bool)
+                or state["brokerEpoch"] < 1
+                or not isinstance(state.get("controlGeneration"), int)
+                or isinstance(state.get("controlGeneration"), bool)
+                or state["controlGeneration"] < 1
+                or not isinstance(state.get("effectiveMode"), str)
+                or not _IDENTIFIER.fullmatch(state["effectiveMode"])
+                or state.get("health") != "healthy"
+                or state.get("appliedAtSafeBoundary") is not True
+            ):
+                raise AdmissionDeferred(
+                    "resource_probe_invalid",
+                    f"resource probe controller state {controller_id} is invalid",
+                )
+            checkpoint = state.get("checkpoint")
+            if checkpoint is not None and (
+                not isinstance(checkpoint, dict)
+                or set(checkpoint) != {"runId", "checkpointId", "sha256"}
+                or not all(
+                    isinstance(checkpoint.get(key), str) and checkpoint[key]
+                    for key in ("runId", "checkpointId")
+                )
+                or not re.fullmatch(r"[a-f0-9]{64}", checkpoint.get("sha256", ""))
+            ):
+                raise AdmissionDeferred(
+                    "resource_probe_invalid",
+                    f"resource probe controller state {controller_id} checkpoint is invalid",
+                )
+        gpu_memory = remote.get("gpuMemory")
+        if gpu_memory is not None:
+            expected_gpu_memory_fields = {
+                "reportedUsedBytes", "attributedBytes", "residualBytes",
+                "reconciled", "toleranceBytes",
+            }
+            byte_fields = ("reportedUsedBytes", "attributedBytes", "residualBytes", "toleranceBytes")
+            if (
+                not isinstance(gpu_memory, dict)
+                or set(gpu_memory) != expected_gpu_memory_fields
+                or not isinstance(gpu_memory.get("reconciled"), bool)
+                or any(
+                    gpu_memory.get(field) is not None
+                    and (
+                        not isinstance(gpu_memory[field], int)
+                        or isinstance(gpu_memory[field], bool)
+                        or (field != "residualBytes" and gpu_memory[field] < 0)
+                    )
+                    for field in byte_fields
+                )
+                or gpu_memory.get("toleranceBytes") is None
+                or (
+                    gpu_memory.get("reportedUsedBytes") is not None
+                    and gpu_memory.get("reconciled") is False
+                    and unknown == 0
+                )
+            ):
+                raise AdmissionDeferred(
+                    "resource_probe_invalid", "resource probe gpuMemory reconciliation is invalid"
+                )
+        generation = remote["generation"]
+        if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+            raise AdmissionDeferred("resource_probe_invalid", "resource probe generation is invalid")
+        if generation < self._last_probe_generation:
+            raise AdmissionDeferred(
+                "resource_probe_regressed",
+                "resource probe generation moved backwards",
+            )
+        self._last_probe_generation = generation
         return {
             **local,
-            "probeHealthy": remote.get("health") == "healthy",
+            "probeHealthy": health == "healthy" and active_healthy,
             "unknownConsumers": unknown,
             "activeProfiles": active_profiles,
             "profiles": profiles,
-            "probeGeneration": remote.get("generation"),
+            "controllerStates": controller_states,
+            "gpuMemory": gpu_memory,
+            "probeGeneration": generation,
         }
 
     def _validate_snapshot(self, snapshot: dict[str, Any], plan: ExecutionPlan, *, check_capacity: bool) -> None:
