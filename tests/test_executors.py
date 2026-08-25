@@ -23,6 +23,18 @@ class FakeTextHandler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self) -> None:
+        if self.path == "/v1/resource-snapshot" and self.headers.get("Authorization") == f"Bearer {'g' * 32}":
+            payload = json.dumps({
+                "health": "healthy", "generation": 1, "unknownConsumers": 0,
+                "activeProfiles": ["gpu.openai-compatible"],
+                "profiles": {"gpu.openai-compatible": {"health": "healthy"}},
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if self.headers.get("Authorization") != "Bearer test-key":
             self.send_response(401)
         elif self.path == "/readyz":

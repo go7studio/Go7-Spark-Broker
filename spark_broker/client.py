@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import urllib.error
 import urllib.parse
@@ -24,6 +25,19 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def read_credential(path: Path, label: str = "broker token") -> str:
+    try:
+        stat = path.stat()
+        if stat.st_uid != os.geteuid() or stat.st_mode & 0o077:
+            raise ValueError(f"{label} file must be owned by the current account and mode 0600 or stricter")
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ValueError(f"{label} file cannot be read") from exc
+    if len(value) < 32:
+        raise ValueError(f"{label} is missing or too short")
+    return value
+
+
 class BrokerClient:
     def __init__(self, base_url: str, token: str, *, timeout: int = 60) -> None:
         parsed = urllib.parse.urlsplit(base_url)
@@ -36,7 +50,10 @@ class BrokerClient:
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.timeout = timeout
-        self._opener = urllib.request.build_opener(_NoRedirect)
+        handlers: list[Any] = [_NoRedirect()]
+        if parsed.hostname in {"127.0.0.1", "localhost", "::1"}:
+            handlers.insert(0, urllib.request.ProxyHandler({}))
+        self._opener = urllib.request.build_opener(*handlers)
 
     def capabilities(self) -> dict[str, Any]:
         return self._json("GET", "/v1/capabilities")
@@ -60,6 +77,8 @@ class BrokerClient:
         return self._json("GET", f"/v1/artifacts/{urllib.parse.quote(artifact_id, safe='')}")
 
     def upload(self, path: Path, *, kind: str, role: str, media_type: str, origin: str) -> dict[str, Any]:
+        if path.stat().st_size > 256 * 1024 * 1024:
+            raise ValueError("client uploads are limited to 256 MiB; use a staged artifact importer for larger files")
         data = path.read_bytes()
         query = urllib.parse.urlencode({"kind": kind, "role": role, "mediaType": media_type})
         return self._request(

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from spark_broker.mcp_server import call_tool
 from spark_broker.server import Broker, BrokerHTTPServer, Config
+from tests.helpers import HealthyHostProbe, write_resource_policy
 from tests.test_executors import FakeTextHandler
 
 
@@ -20,13 +21,19 @@ class MCPFlowTests(unittest.TestCase):
         self.provider = ThreadingHTTPServer(("127.0.0.1", 0), FakeTextHandler)
         self.provider_thread = threading.Thread(target=self.provider.serve_forever, daemon=True)
         self.provider_thread.start()
+        root = Path(self.temporary.name)
+        provider_url = f"http://127.0.0.1:{self.provider.server_address[1]}"
+        policy = write_resource_policy(root, provider_url)
         config = Config(
             broker_id="spark.mcp-test", bind="127.0.0.1", port=0, token="m" * 32,
-            data_root=Path(self.temporary.name), hunyuan_root=None, stop_containers=(),
-            text_endpoint=f"http://127.0.0.1:{self.provider.server_address[1]}", text_api_key="test-key",
+            data_root=root / "data", hunyuan_root=None, stop_containers=(),
+            text_endpoint=provider_url, text_api_key="test-key",
             text_model="local-test-model", text_container=None, max_artifact_bytes=64 * 1024 * 1024,
+            resource_policy_file=policy, coordinator_lock_file=root / "gpu0.lock",
+            coordinator_epoch_file=root / "gpu0.epoch",
         )
         self.broker = Broker(config)
+        self.broker.coordinator.host_probe = HealthyHostProbe()
         self.http = BrokerHTTPServer((config.bind, 0), self.broker)
         self.broker.start()
         self.http_thread = threading.Thread(target=self.http.serve_forever, daemon=True)

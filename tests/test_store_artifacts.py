@@ -96,6 +96,19 @@ class StoreArtifactTests(unittest.TestCase):
         with self.assertRaises(QueueFull):
             self.store.submit(second_request, max_pending_jobs=1)
 
+    def test_deferred_high_priority_job_does_not_starve_runnable_work(self) -> None:
+        high_request = validate_job_request(
+            request(idempotencyKey="deferred-high", priority=100), broker_id="spark.test"
+        )
+        high, _ = self.store.submit(high_request)
+        self.assertEqual(self.store.claim_next({"system.echo"})["id"], high["id"])
+        self.store.defer(high["id"], detail={"code": "resource_busy"}, delay_seconds=60)
+        low_request = validate_job_request(
+            request(idempotencyKey="runnable-low", priority=10), broker_id="spark.test"
+        )
+        low, _ = self.store.submit(low_request)
+        self.assertEqual(self.store.claim_next({"system.echo"})["id"], low["id"])
+
     def test_cancel_queued_job_is_terminal_and_idempotent(self) -> None:
         value = validate_job_request(request(), broker_id="spark.test")
         job, _ = self.store.submit(value)

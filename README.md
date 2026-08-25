@@ -93,9 +93,11 @@ configuration. Use credential files. Run `./deploy-user.sh --no-start` when a
 service must be reviewed before first launch.
 
 The system-wide template `systemd/go7-spark-broker@.service` is available for
-managed hosts. Its administrator must provide `/etc/go7-spark-broker/USER.env`,
-the installation under `/opt/go7-spark-broker`, data-directory ownership, and
-any workload-specific systemd path permissions.
+managed hosts using one dedicated GPU service account. Its administrator must
+provide `/etc/go7-spark-broker/USER.env`, the installation under
+`/opt/go7-spark-broker`, host-lock and durable-epoch directory ownership, and
+any workload-specific systemd path permissions. The generic user unit is safe
+for the CPU-only default; it does not invent a per-user GPU lock.
 
 ## Configure capabilities
 
@@ -108,6 +110,21 @@ SPARK_BROKER_PORT=8790
 SPARK_BROKER_TOKEN_FILE=/absolute/path/to/broker-token
 SPARK_BROKER_DATA=/absolute/path/to/broker-data
 ```
+
+GPU capabilities additionally require all of the following; broker startup
+fails without them:
+
+```dotenv
+SPARK_COORDINATOR_LOCK_FILE=/run/go7-spark-broker/gpu0.lock
+SPARK_COORDINATOR_EPOCH_FILE=/var/lib/go7-spark-broker/host/gpu0.epoch
+SPARK_RESOURCE_POLICY_FILE=/absolute/path/to/resource-policy.json
+```
+
+The live lock and durable epoch must be shared by every broker process that can
+touch the same GPU, even across data directories. Production configuration
+rejects temporary and per-user runtime locations. Provision the paths for one
+dedicated service account; do not grant independent user services direct GPU
+mutation authority.
 
 `deploy-user.sh` supplies the token and data paths when they are omitted from
 an imported configuration. With the shipped user service, keep data beneath
@@ -127,9 +144,12 @@ SPARK_OPENAI_DESCRIPTION=Local OpenAI-compatible text generation
 SPARK_OPENAI_ESTIMATED_MEMORY_GB=48
 ```
 
-`SPARK_OPENAI_CONTAINER` is optional. When present, the broker checks and starts
+`SPARK_OPENAI_CONTAINER` is optional only when no governor controller can be
+displaced. When present, the broker checks and starts
 that exact allowlisted Docker container before waiting on the loopback runtime's
-`/readyz` endpoint. Legacy `SPARK_TEXT_*` values remain accepted for upgrades.
+`/readyz` endpoint, then stops it before resuming displaced training or
+background work. Controller-backed GPU profiles must provide this managed
+unload lifecycle. Legacy `SPARK_TEXT_*` values remain accepted for upgrades.
 
 For multiple inference profiles, copy
 [`examples/inference-routes.example.json`](examples/inference-routes.example.json)
@@ -154,9 +174,11 @@ outside the checkout and configure:
 SPARK_RESOURCE_POLICY_FILE=/absolute/path/to/resource-policy.json
 ```
 
-The governor contract uses a broker lease ID, broker epoch fence, and monotonic
-control generation. The broker re-reads the resource snapshot after a control
-acknowledgement and refuses the job if an incompatible profile remains. See
+The governor contract uses a broker lease ID, explicit durable broker epoch,
+fence, control generation, and a shared causal snapshot generation. Training
+controllers must prove a durable checkpoint boundary. The broker re-reads the
+resource snapshot after control and activation, unloads the selected model
+before restoring displaced work, and refuses incompatible coexistence. See
 [Resource governor protocol](docs/RESOURCE-GOVERNOR.md).
 
 Optional Hunyuan3D adapter:
@@ -216,6 +238,10 @@ token-file environment and exposes discovery, generic submit, convenience
 text/3D calls, model and service-class routing, status, events, cancellation,
 and chunked artifact transfer. Full downloads are verified against the
 registered artifact digest.
+
+CLI file uploads are bounded to 256 MiB to avoid reading multi-gigabyte files
+into client memory. Larger assets need an administrator-installed staged
+importer rather than the convenience upload command.
 Workhorse does not require `spark-mcp`; Workhorse talks to the broker protocol
 directly.
 

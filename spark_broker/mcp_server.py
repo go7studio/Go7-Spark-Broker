@@ -10,14 +10,14 @@ from typing import Any, Callable
 
 from . import BROKER_VERSION, PROTOCOL_VERSION
 from .cli import request_envelope
-from .client import BrokerClient, ClientError
+from .client import BrokerClient, ClientError, read_credential
 
 
 def client() -> BrokerClient:
     token = os.environ.get("SPARK_BROKER_TOKEN", "")
     token_file = os.environ.get("SPARK_BROKER_TOKEN_FILE", "")
     if not token and token_file:
-        token = Path(token_file).read_text(encoding="utf-8").strip()
+        token = read_credential(Path(token_file))
     if not token:
         raise RuntimeError("SPARK_BROKER_TOKEN or SPARK_BROKER_TOKEN_FILE is required")
     return BrokerClient(os.environ.get("SPARK_BROKER_URL", "http://127.0.0.1:8790"), token, timeout=int(os.environ.get("SPARK_MCP_TIMEOUT", "60")))

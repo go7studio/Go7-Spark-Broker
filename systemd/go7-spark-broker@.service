@@ -7,6 +7,12 @@ Wants=network-online.target
 Type=simple
 User=%i
 Group=%i
+RuntimeDirectory=go7-spark-broker
+RuntimeDirectoryMode=0700
+StateDirectory=go7-spark-broker/host go7-spark-broker/%i
+StateDirectoryMode=0700
+Environment=SPARK_COORDINATOR_LOCK_FILE=/run/go7-spark-broker/gpu0.lock
+Environment=SPARK_COORDINATOR_EPOCH_FILE=/var/lib/go7-spark-broker/host/gpu0.epoch
 EnvironmentFile=/etc/go7-spark-broker/%i.env
 ExecStart=/opt/go7-spark-broker/venv/bin/spark-broker
 Restart=on-failure
@@ -15,7 +21,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/var/lib/go7-spark-broker/%i -%h/workloads
+ReadWritePaths=/var/lib/go7-spark-broker/%i /var/lib/go7-spark-broker/host /run/go7-spark-broker -%h/workloads
 RestrictSUIDSGID=true
 LockPersonality=true
 UMask=0077

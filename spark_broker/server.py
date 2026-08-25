@@ -24,6 +24,7 @@ from .store import IdempotencyConflict, QueueFull, Store
 
 _JOB_ID = re.compile(r"^job_[a-f0-9]{32}$")
 _ARTIFACT_ID = re.compile(r"^art_[a-f0-9]{32}$")
+_BROKER_ID = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+){0,7}$")
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,9 @@ class Config:
     max_storage_bytes: int = 100 * 1024 * 1024 * 1024
     request_timeout_seconds: int = 30
     max_concurrent_uploads: int = 2
+    coordinator_lock_file: Path | None = None
+    coordinator_epoch_file: Path | None = None
+    enforce_host_lock_scope: bool = False
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -101,6 +105,9 @@ class Config:
             max_storage_bytes=int(os.environ.get("SPARK_MAX_STORAGE_BYTES", str(100 * 1024 * 1024 * 1024))),
             request_timeout_seconds=int(os.environ.get("SPARK_REQUEST_TIMEOUT_SECONDS", "30")),
             max_concurrent_uploads=int(os.environ.get("SPARK_MAX_CONCURRENT_UPLOADS", "2")),
+            coordinator_lock_file=Path(os.environ["SPARK_COORDINATOR_LOCK_FILE"]) if os.environ.get("SPARK_COORDINATOR_LOCK_FILE") else None,
+            coordinator_epoch_file=Path(os.environ["SPARK_COORDINATOR_EPOCH_FILE"]) if os.environ.get("SPARK_COORDINATOR_EPOCH_FILE") else None,
+            enforce_host_lock_scope=True,
         )
 
 
@@ -119,6 +126,8 @@ def _read_credential(path: Path, label: str) -> str:
 class Broker:
     def __init__(self, config: Config) -> None:
         self.config = config
+        if not _BROKER_ID.fullmatch(config.broker_id):
+            raise ValueError("broker_id is invalid")
         config.data_root.mkdir(parents=True, exist_ok=True)
         self.store = Store(config.data_root / "broker.sqlite3")
         if (
@@ -149,7 +158,47 @@ class Broker:
             openai_routes=routes,
         )
         policy = ResourcePolicy.from_file(config.resource_policy_file) if config.resource_policy_file else ResourcePolicy()
-        self.coordinator = ResourceCoordinator(store=self.store, data_root=config.data_root, policy=policy)
+        gpu_installed = any(executor.capability.resource_group is not None for executor in self.executors.values())
+        if gpu_installed:
+            if (
+                config.coordinator_lock_file is None
+                or not config.coordinator_lock_file.is_absolute()
+                or config.coordinator_epoch_file is None
+                or not config.coordinator_epoch_file.is_absolute()
+            ):
+                raise ValueError("GPU capabilities require absolute coordinator lock and durable epoch files")
+            if config.enforce_host_lock_scope:
+                resolved_lock = config.coordinator_lock_file.resolve()
+                resolved_epoch = config.coordinator_epoch_file.resolve()
+                unsafe_roots = [Path("/tmp"), Path("/var/tmp")]
+                if os.environ.get("XDG_RUNTIME_DIR"):
+                    unsafe_roots.append(Path(os.environ["XDG_RUNTIME_DIR"]).resolve())
+                if any(
+                    value == root or root in value.parents
+                    for value in (resolved_lock, resolved_epoch)
+                    for root in unsafe_roots
+                ):
+                    raise ValueError("GPU coordinator lock must use an administrator-provisioned host-wide path")
+            if (
+                config.resource_policy_file is None
+                or not policy.require_probe
+                or not policy.enforce_memory_admission
+                or not policy.probe_endpoint
+                or not policy.probe_token_file
+            ):
+                raise ValueError("GPU capabilities require a resource policy with required probe and memory admission")
+            if policy.controllers and any(
+                executor.capability.resource_group is not None and not executor.has_managed_unload()
+                for executor in self.executors.values()
+            ):
+                raise ValueError("controller-backed GPU profiles require a broker-managed unload lifecycle")
+        self.coordinator = ResourceCoordinator(
+            store=self.store,
+            data_root=config.data_root,
+            policy=policy,
+            lock_path=config.coordinator_lock_file,
+            epoch_path=config.coordinator_epoch_file,
+        )
         self.scheduler = Scheduler(
             broker_id=config.broker_id,
             store=self.store,
@@ -160,11 +209,18 @@ class Broker:
 
     def start(self) -> None:
         self.coordinator.start()
-        # Crash leftovers must be removed before the scheduler can load a
-        # different GPU profile onto the same device.
-        for executor in self.executors.values():
-            executor.startup_cleanup()
-        self.scheduler.start()
+        try:
+            if self.coordinator.quarantined:
+                return
+            # Crash leftovers must be removed before the scheduler can load a
+            # different GPU profile onto the same device. Quarantined state is
+            # served read-only for diagnosis; no runtime cleanup or claims run.
+            for executor in self.executors.values():
+                executor.startup_cleanup()
+            self.scheduler.start()
+        except BaseException:
+            self.coordinator.stop()
+            raise
 
     def stop(self) -> None:
         self.scheduler.stop()
@@ -213,8 +269,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 self._error(HTTPStatus.UNAUTHORIZED, "unauthorized", "valid bearer token required")
                 return
             if path == "/health/ready" and method in {"GET", "HEAD"}:
-                ready = self.server.broker.scheduler.status()["schedulerAlive"]
-                self._json(HTTPStatus.OK if ready else HTTPStatus.SERVICE_UNAVAILABLE, {"status": "ready" if ready else "not_ready"}, head=method == "HEAD")
+                ready, scheduler_status = self._readiness()
+                resources = scheduler_status.get("resources", {})
+                self._json(
+                    HTTPStatus.OK if ready else HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"status": "ready" if ready else "not_ready", "resourceState": resources.get("resourceState")},
+                    head=method == "HEAD",
+                )
                 return
             if path == "/v1/capabilities" and method == "GET":
                 self._json(HTTPStatus.OK, self._capabilities())
@@ -262,11 +323,17 @@ class BrokerHandler(BaseHTTPRequestHandler):
         return hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
 
     def _capabilities(self) -> dict[str, Any]:
+        ready, scheduler_status = self._readiness()
+        resource_state = scheduler_status.get("resources", {}).get("resourceState", "unavailable")
         return {
             "protocolVersion": PROTOCOL_VERSION,
             "brokerVersion": BROKER_VERSION,
             "brokerId": self.server.broker.config.broker_id,
-            "capabilities": self.server.broker.scheduler.capabilities(),
+            "resourceState": resource_state,
+            "capabilities": [
+                {**capability, "available": ready}
+                for capability in self.server.broker.scheduler.capabilities()
+            ],
             "inferenceRoutes": {
                 capability: executor.public_routes()
                 for capability, executor in self.server.broker.executors.items()
@@ -288,6 +355,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if request["capability"] not in self.server.broker.executors:
             self._error(HTTPStatus.UNPROCESSABLE_ENTITY, "capability_unavailable", "capability is not installed on this broker")
             return
+        ready, _status = self._readiness()
+        if not ready:
+            self._error(HTTPStatus.SERVICE_UNAVAILABLE, "broker_not_ready", "scheduler or resource coordinator is not ready")
+            return
         for reference in request["inputs"]:
             artifact = self.server.broker.store.get_artifact(reference["artifactId"])
             if not artifact:
@@ -297,6 +368,16 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if created:
             self.server.broker.scheduler.notify()
         self._json(HTTPStatus.ACCEPTED if created else HTTPStatus.OK, self._public_job(job), headers={"Location": f"/v1/jobs/{job['id']}", "Idempotency-Replayed": "false" if created else "true"})
+
+    def _readiness(self) -> tuple[bool, dict[str, Any]]:
+        status = self.server.broker.scheduler.status()
+        resources = status.get("resources", {})
+        ready = bool(
+            status["schedulerAlive"]
+            and status["controlLoopAlive"]
+            and resources.get("resourceState") == "ready"
+        )
+        return ready, status
 
     def _upload_artifact(self, query: str) -> None:
         if not self.server.upload_slots.acquire(blocking=False):

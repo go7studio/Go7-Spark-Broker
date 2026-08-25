@@ -13,6 +13,9 @@
 - Fail protocol-1.0 training yields instead of reporting false completion.
 - Harden credential files, redirects, aggregate storage, queue depth, MCP input,
   upload concurrency, request timeouts, CI pins, and public-history hygiene.
+- Require observable GPU admission, host-wide live locking plus durable epochs,
+  causal governor generations, verified training checkpoints, managed unload
+  before training resume, and new-epoch recovery takeover.
 
 ## 0.1.0
 

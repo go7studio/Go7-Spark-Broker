@@ -31,6 +31,12 @@ class ExecutionFailure(RuntimeError):
         self.retryable = retryable
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+        del req, fp, code, msg, headers, newurl
+        return None
+
+
 @dataclass(frozen=True)
 class Capability:
     id: str
@@ -172,6 +178,13 @@ class Executor:
         del plan
         return self.execute(job, registry, cancelled, stage)
 
+    def deactivate_plan(self, plan: ExecutionPlan) -> bool:
+        del plan
+        return self.capability.resource_group is None
+
+    def has_managed_unload(self) -> bool:
+        return self.capability.resource_group is None
+
     def activate(self, cancelled: Callable[[], bool]) -> None:
         del cancelled
 
@@ -288,6 +301,13 @@ class Hunyuan3DExecutor(Executor):
 
     def available(self) -> bool:
         return (self.workload_root / "compose.yaml").is_file() and (self.workload_root / "assets").is_dir() and (self.workload_root / "out").is_dir()
+
+    def has_managed_unload(self) -> bool:
+        return True
+
+    def deactivate_plan(self, plan: ExecutionPlan) -> bool:
+        del plan
+        return True
 
     def activate(self, cancelled: Callable[[], bool]) -> None:
         self._cleanup_stale_job_containers(cancelled)
@@ -696,6 +716,7 @@ class OpenAIChatExecutor(Executor):
         self.api_key = api_key
         self.model = model
         self.container_name = container_name
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
         if container_name and not Hunyuan3DExecutor._SAFE_CONTAINER.fullmatch(container_name):
             raise ValueError("text container must be a literal Docker name")
 
@@ -731,13 +752,55 @@ class OpenAIChatExecutor(Executor):
                 raise ExecutionCancelled("job was cancelled while loading text profile")
             try:
                 request = urllib.request.Request(f"{self.endpoint}/readyz", headers={"Authorization": f"Bearer {self.api_key}"})
-                with urllib.request.urlopen(request, timeout=10) as response:
+                with self._opener.open(request, timeout=10) as response:
                     if response.status == 200:
                         return
             except (urllib.error.URLError, TimeoutError):
                 pass
             time.sleep(2)
         raise ExecutionFailure("profile_load_timeout", "text model did not become ready within 900 seconds", retryable=True)
+
+    def plan(self, job: dict[str, Any], routing_context: dict[str, Any] | None = None) -> ExecutionPlan:
+        base = super().plan(job, routing_context)
+        return ExecutionPlan(
+            profile_id=base.profile_id,
+            route_id=base.route_id,
+            resource_group=base.resource_group,
+            service_class=base.service_class,
+            lease_mode=base.lease_mode,
+            estimated_memory_gb=base.estimated_memory_gb,
+            preemption_mode=base.preemption_mode,
+            route_reason=base.route_reason,
+            verify_profile_active=True,
+        )
+
+    def deactivate_plan(self, plan: ExecutionPlan) -> bool:
+        del plan
+        if not self.container_name:
+            return False
+        try:
+            result = subprocess.run(
+                ["docker", "stop", "--time", "30", self.container_name],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=60,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ExecutionFailure(
+                "profile_unload_timeout", f"timed out unloading text profile container {self.container_name}",
+                retryable=False,
+            ) from exc
+        if result.returncode != 0:
+            raise ExecutionFailure(
+                "profile_unload_failed", f"could not stop text profile container {self.container_name}",
+                retryable=False,
+            )
+        return True
+
+    def has_managed_unload(self) -> bool:
+        return self.container_name is not None
 
     def validate_request(self, job: dict[str, Any], registry: ArtifactRegistry) -> None:
         request = job["request"]
@@ -812,7 +875,7 @@ class OpenAIChatExecutor(Executor):
             headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json", "Accept": "application/json"},
         )
         try:
-            with urllib.request.urlopen(http_request, timeout=constraints["timeoutSeconds"]) as response:
+            with self._opener.open(http_request, timeout=constraints["timeoutSeconds"]) as response:
                 limit = 4 * 1024 * 1024
                 response_bytes = response.read(limit + 1)
                 if len(response_bytes) > limit:
@@ -1020,6 +1083,9 @@ class RoutedOpenAIChatExecutor(Executor):
     def public_routes(self) -> list[dict[str, Any]]:
         return [route.public() for route in sorted(self.routes, key=lambda item: item.id)]
 
+    def has_managed_unload(self) -> bool:
+        return all(backend.has_managed_unload() for backend in self.backends.values())
+
     def validate_request(self, job: dict[str, Any], registry: ArtifactRegistry) -> None:
         plan = self.plan(job)
         self.backends[plan.route_id or ""].validate_request(self._delegate_job(job), registry)
@@ -1079,10 +1145,14 @@ class RoutedOpenAIChatExecutor(Executor):
             lease_mode="permit",
             estimated_memory_gb=selected.estimated_memory_gb,
             route_reason="explicit_model" if model is not None else f"policy:{preference}",
+            verify_profile_active=True,
         )
 
     def activate_plan(self, plan: ExecutionPlan, cancelled: Callable[[], bool]) -> None:
         self.backends[plan.route_id or ""].activate(cancelled)
+
+    def deactivate_plan(self, plan: ExecutionPlan) -> bool:
+        return self.backends[plan.route_id or ""].deactivate_plan(plan)
 
     def execute_plan(
         self,

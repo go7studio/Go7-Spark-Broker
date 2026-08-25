@@ -11,6 +11,7 @@ from spark_broker.executors import Capability, EchoExecutor, Executor
 from spark_broker.scheduler import Scheduler
 from spark_broker.store import Store
 from spark_broker.contract import validate_job_request
+from spark_broker.resources import AdmissionDeferred, ExecutionControl, ExecutionPlan, LeaseHandle
 from tests.helpers import request
 
 
@@ -54,6 +55,58 @@ class YieldingTrainingExecutor(Executor):
                 return {"artifacts": [], "continuations": [], "data": {"outcome": "yielded"}}
             time.sleep(0.01)
         return {"artifacts": [], "continuations": [], "data": {"outcome": "completed"}}
+
+
+class InteractiveEcho(EchoExecutor):
+    capability = Capability(
+        "text.interactive.test", "cpu.interactive", "interactive test", (), (), 0,
+        resource_group=None, service_class="interactive", lease_mode="none",
+    )
+
+
+class PartialActivationExecutor(Executor):
+    capability = Capability(
+        "runtime.partial.test", "cpu.partial", "partial activation test", (), (), 0,
+        resource_group=None, service_class="batch", lease_mode="none",
+    )
+
+    def __init__(self) -> None:
+        self.deactivated = False
+
+    def activate(self, cancelled):
+        del cancelled
+        raise RuntimeError("readiness failed after partial activation")
+
+    def deactivate_plan(self, plan):
+        del plan
+        self.deactivated = True
+        return True
+
+    def execute(self, job, registry, cancelled, stage):
+        raise AssertionError("execute must not run")
+
+
+class ReleaseFailingCoordinator:
+    def __init__(self) -> None:
+        self.release_calls = 0
+
+    def routing_context(self):
+        return {}
+
+    def acquire(self, job, plan, cancelled):
+        del cancelled
+        return LeaseHandle(lease={
+            "id": "lease_test", "jobId": job["id"], "mode": plan.lease_mode,
+            "profileId": plan.profile_id, "fencingToken": "fence_test",
+        })
+
+    def verify_activation(self, handle, plan):
+        del handle, plan
+
+    def release(self, handle):
+        del handle
+        self.release_calls += 1
+        raise AdmissionDeferred("release_unverified", "release could not be verified")
 
 
 class SchedulerTests(unittest.TestCase):
@@ -175,7 +228,7 @@ class SchedulerTests(unittest.TestCase):
         self.scheduler.stop()
         started = threading.Event()
         training = YieldingTrainingExecutor(started)
-        echo = EchoExecutor()
+        echo = InteractiveEcho()
         scheduler = Scheduler(
             broker_id="spark.test", store=self.store, registry=self.registry,
             executors={training.capability.id: training, echo.capability.id: echo},
@@ -201,6 +254,98 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(training_result["status"], "failed")
         self.assertEqual(training_result["error"]["code"], "yield_protocol_unsupported")
         self.assertEqual(interactive_result["status"], "completed")
+
+    def test_stop_refuses_to_release_ownership_while_worker_is_alive(self) -> None:
+        self.scheduler.stop()
+        release = threading.Event()
+        blocked = threading.Thread(target=release.wait, name="blocked-scheduler", daemon=True)
+        blocked.start()
+        self.scheduler._thread = blocked
+        self.scheduler._control_thread = None
+        try:
+            with self.assertRaisesRegex(RuntimeError, "ownership is retained"):
+                self.scheduler.stop(timeout=0.01)
+        finally:
+            release.set()
+            blocked.join(1)
+
+    def test_release_failure_never_requeues_an_already_executed_job(self) -> None:
+        self.scheduler.stop()
+        coordinator = ReleaseFailingCoordinator()
+        executor = EchoExecutor()
+        scheduler = Scheduler(
+            broker_id="spark.test", store=self.store, registry=self.registry,
+            executors={executor.capability.id: executor}, coordinator=coordinator,  # type: ignore[arg-type]
+        )
+        value = validate_job_request(
+            request(idempotencyKey="release-uncertain-test"), broker_id="spark.test"
+        )
+        job, _ = self.store.submit(value)
+        scheduler.start()
+        scheduler.notify()
+        try:
+            finished = self.wait(job["id"])
+        finally:
+            scheduler.stop()
+        self.assertEqual(finished["status"], "failed")
+        self.assertEqual(finished["error"]["code"], "resource_release_uncertain")
+        self.assertFalse(finished["error"]["retryable"])
+        self.assertGreaterEqual(coordinator.release_calls, 1)
+
+    def test_partial_activation_is_compensated(self) -> None:
+        self.scheduler.stop()
+        executor = PartialActivationExecutor()
+        scheduler = Scheduler(
+            broker_id="spark.test", store=self.store, registry=self.registry,
+            executors={executor.capability.id: executor},
+        )
+        value = validate_job_request(
+            request(capability=executor.capability.id, idempotencyKey="partial-activation"),
+            broker_id="spark.test",
+        )
+        job, _ = self.store.submit(value)
+        scheduler.start()
+        scheduler.notify()
+        try:
+            finished = self.wait(job["id"])
+        finally:
+            scheduler.stop()
+        self.assertEqual(finished["status"], "failed")
+        self.assertTrue(executor.deactivated)
+
+    def test_control_loop_failure_stops_main_claiming_loop(self) -> None:
+        self.scheduler.stop()
+        executor = EchoExecutor()
+        scheduler = Scheduler(
+            broker_id="spark.test", store=self.store, registry=self.registry,
+            executors={executor.capability.id: executor},
+        )
+        scheduler.start()
+        with scheduler._state_lock:
+            scheduler._active_priority = 1
+            scheduler._active_plan = ExecutionPlan(
+                profile_id="gpu.training", route_id=None, resource_group="gpu:0",
+                service_class="training", lease_mode="exclusive", estimated_memory_gb=1,
+                preemption_mode="checkpoint",
+            )
+            scheduler._active_control = ExecutionControl(lambda: False)
+        original = self.store.peek_queued
+
+        def broken(*args, **kwargs):
+            raise RuntimeError("database failure")
+
+        self.store.peek_queued = broken  # type: ignore[method-assign]
+        scheduler.notify()
+        try:
+            for _ in range(100):
+                if not scheduler.status()["controlLoopAlive"]:
+                    break
+                time.sleep(0.01)
+            self.assertFalse(scheduler.status()["controlLoopAlive"])
+            self.assertTrue(scheduler._stop.is_set())
+        finally:
+            self.store.peek_queued = original  # type: ignore[method-assign]
+            scheduler.stop()
 
 
 if __name__ == "__main__":

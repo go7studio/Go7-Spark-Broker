@@ -5,6 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+RuntimeDirectory=go7-spark-broker
+RuntimeDirectoryMode=0700
 EnvironmentFile=%h/.config/go7-spark-broker/env
 ExecStart=%h/.local/share/go7-spark-broker/venv/bin/spark-broker
 Restart=on-failure

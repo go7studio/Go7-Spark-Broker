@@ -12,13 +12,15 @@
     {
       "id": "background-workload",
       "profileId": "gpu.background-workload",
+      "workloadKind": "training",
       "endpoint": "http://127.0.0.1:9001",
       "tokenFile": "/absolute/path/to/background-controller-key",
       "throttleFor": [
         "interactive"
       ],
       "normalMode": "normal",
-      "throttledMode": "interactive-boost",
+      "throttledMode": "checkpoint-release",
+      "requiresCheckpoint": true,
       "priority": 20
     }
   ],

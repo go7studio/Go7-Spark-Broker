@@ -5,7 +5,7 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -146,12 +146,17 @@ class Store:
                 ON resource_leases(job_id, created_at);
             """
         )
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(jobs)").fetchall()}
+        if "not_before" not in columns:
+            connection.execute("ALTER TABLE jobs ADD COLUMN not_before TEXT")
 
-    def begin_broker_epoch(self, instance_id: str) -> int:
+    def begin_broker_epoch(self, instance_id: str, *, minimum_epoch: int = 1) -> int:
+        if minimum_epoch < 1:
+            raise ValueError("minimum epoch must be positive")
         now = utc_now()
         with self.transaction(immediate=True) as tx:
             row = tx.execute("SELECT epoch FROM broker_epochs WHERE singleton=1").fetchone()
-            epoch = int(row["epoch"]) + 1 if row else 1
+            epoch = max(int(row["epoch"]) + 1 if row else 1, minimum_epoch)
             tx.execute(
                 """INSERT INTO broker_epochs(singleton,epoch,instance_id,started_at) VALUES(1,?,?,?)
                    ON CONFLICT(singleton) DO UPDATE SET epoch=excluded.epoch,instance_id=excluded.instance_id,started_at=excluded.started_at""",
@@ -307,13 +312,17 @@ class Store:
         placeholders = ",".join("?" for _ in supported)
         with self.transaction(immediate=True) as tx:
             row = tx.execute(
-                f"SELECT * FROM jobs WHERE status='queued' AND capability IN ({placeholders}) ORDER BY priority DESC, created_at ASC LIMIT 1",
-                tuple(sorted(supported)),
+                f"""SELECT * FROM jobs
+                    WHERE status='queued' AND cancel_requested=0
+                      AND (not_before IS NULL OR not_before<=?)
+                      AND capability IN ({placeholders})
+                    ORDER BY priority DESC, created_at ASC LIMIT 1""",
+                (now, *tuple(sorted(supported))),
             ).fetchone()
             if not row:
                 return None
             updated = tx.execute(
-                "UPDATE jobs SET status='loading', attempt=attempt+1, started_at=COALESCE(started_at,?), updated_at=? WHERE id=? AND status='queued'",
+                "UPDATE jobs SET status='loading', not_before=NULL, attempt=attempt+1, started_at=COALESCE(started_at,?), updated_at=? WHERE id=? AND status='queued' AND cancel_requested=0",
                 (now, now, row["id"]),
             )
             if updated.rowcount != 1:
@@ -326,21 +335,35 @@ class Store:
         return self._job_from_row(claimed)
 
     def peek_next(self, supported: set[str]) -> dict[str, Any] | None:
-        if not supported:
-            return None
-        placeholders = ",".join("?" for _ in supported)
-        row = self._connection().execute(
-            f"SELECT * FROM jobs WHERE status='queued' AND capability IN ({placeholders}) ORDER BY priority DESC, created_at ASC LIMIT 1",
-            tuple(sorted(supported)),
-        ).fetchone()
-        return self._job_from_row(row) if row else None
+        values = self.peek_queued(supported, limit=1)
+        return values[0] if values else None
 
-    def defer(self, job_id: str, *, detail: dict[str, Any]) -> None:
+    def peek_queued(self, supported: set[str], *, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        if not supported:
+            return []
+        if not 1 <= limit <= 100:
+            raise ValueError("peek limit must be 1-100")
+        if offset < 0:
+            raise ValueError("peek offset must be non-negative")
         now = utc_now()
+        placeholders = ",".join("?" for _ in supported)
+        rows = self._connection().execute(
+            f"""SELECT * FROM jobs
+                WHERE status='queued' AND cancel_requested=0
+                  AND (not_before IS NULL OR not_before<=?)
+                  AND capability IN ({placeholders})
+                ORDER BY priority DESC, created_at ASC LIMIT ? OFFSET ?""",
+            (now, *tuple(sorted(supported)), limit, offset),
+        ).fetchall()
+        return [self._job_from_row(row) for row in rows]
+
+    def defer(self, job_id: str, *, detail: dict[str, Any], delay_seconds: float = 2.0) -> None:
+        now = utc_now()
+        not_before = (datetime.now(timezone.utc) + timedelta(seconds=max(0.1, min(delay_seconds, 300)))).isoformat().replace("+00:00", "Z")
         with self.transaction(immediate=True) as tx:
             updated = tx.execute(
-                "UPDATE jobs SET status='queued',updated_at=? WHERE id=? AND status IN ('loading','running') AND cancel_requested=0",
-                (now, job_id),
+                "UPDATE jobs SET status='queued',not_before=?,updated_at=? WHERE id=? AND status IN ('loading','running') AND cancel_requested=0",
+                (not_before, now, job_id),
             )
             if updated.rowcount:
                 tx.execute(

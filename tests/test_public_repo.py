@@ -4,7 +4,10 @@ import subprocess
 import tomllib
 import unittest
 import re
+import json
 from pathlib import Path
+
+from spark_broker.resources import ResourcePolicy
 
 
 ROOT = Path(__file__).parents[1]
@@ -39,6 +42,37 @@ class PublicRepositoryTests(unittest.TestCase):
             self.assertEqual(name, "Go7 Studio")
             self.assertTrue(email.endswith("@go7.studio"))
 
+    def test_reachable_history_has_no_secret_material(self) -> None:
+        patterns = (
+            "BEGIN " + "PRIVATE KEY",
+            "BEGIN OPENSSH " + "PRIVATE KEY",
+            "AKIA" + "[A-Z0-9]{16}",
+            "xox" + "[abprs]-[A-Za-z0-9-]{20,}",
+            "hf_" + "[A-Za-z0-9]{24,}",
+            "gh" + "[opusr]_[A-Za-z0-9]{20,}",
+            "sk-" + "[A-Za-z0-9_-]{20,}",
+        )
+        commits = subprocess.run(
+            ["git", "rev-list", "--all"], cwd=ROOT, check=True, capture_output=True, text=True,
+        ).stdout.splitlines()
+        for commit in commits:
+            entries = subprocess.run(
+                ["git", "ls-tree", "-r", "--name-only", commit],
+                cwd=ROOT, check=True, capture_output=True, text=True,
+            ).stdout.splitlines()
+            for relative in entries:
+                if relative == "tests/test_public_repo.py":
+                    continue
+                blob = subprocess.run(
+                    ["git", "show", f"{commit}:{relative}"], cwd=ROOT,
+                    check=True, capture_output=True,
+                ).stdout.decode("utf-8", errors="ignore")
+                for pattern in patterns:
+                    self.assertIsNone(
+                        re.search(pattern, blob),
+                        f"{commit}:{relative} matches secret pattern {pattern}",
+                    )
+
     def test_public_metadata_and_safety_files_ship(self) -> None:
         for relative in (
             "LICENSE",
@@ -67,6 +101,16 @@ class PublicRepositoryTests(unittest.TestCase):
         self.assertIn("inline secrets are refused", installer)
         self.assertIn("elif [[ ! -f \"$broker_config/env\" ]]", installer)
         self.assertIn("systemctl --user restart go7-spark-broker.service", installer)
+
+    def test_shipped_json_examples_are_current_and_strict(self) -> None:
+        routes = json.loads((ROOT / "examples/inference-routes.example.json").read_text(encoding="utf-8"))
+        self.assertEqual(routes["version"], 1)
+        self.assertTrue(routes["routes"])
+        policy = ResourcePolicy.from_file(ROOT / "examples/resource-policy.example.json")
+        self.assertTrue(policy.require_probe)
+        self.assertTrue(policy.enforce_memory_admission)
+        self.assertEqual(policy.controllers[0].workload_kind, "training")
+        self.assertTrue(policy.controllers[0].requires_checkpoint)
 
 
 if __name__ == "__main__":

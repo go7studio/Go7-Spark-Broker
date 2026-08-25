@@ -76,18 +76,21 @@ control loop continues observing higher-priority work while a cooperative
 long-running adapter executes. Pure executor validation and inference route
 selection happen before any resource mutation.
 
-The resource coordinator owns an OS lock, a monotonic broker epoch, and durable
-leases. It samples host memory pressure and an optional administrator-installed
-resource probe, applies fenced controller generations, re-samples after those
-controls, and only then activates the selected profile. Executors never stop
+The resource coordinator owns a host-wide OS lock, a separately durable
+monotonic broker epoch, and durable leases. GPU adapters require an
+administrator-installed resource probe and memory admission. The coordinator
+applies write-ahead-journaled controller generations, verifies their causal
+snapshot generation, activates the selected profile, and re-samples again.
+Executors never stop
 one another. The 3D adapter removes crash leftovers only when they carry the
 exact broker ownership label; cross-profile stop lists are rejected.
 
-An OpenAI-compatible inference profile uses a per-call `permit` because the
-model service may remain resident after the call. Batch/3D work uses an
-exclusive lease. A resident different profile prevents admission unless it was
-verified absent after the governor action. This release does not accept
-shared-mode certifications.
+An OpenAI-compatible inference profile uses a per-call `permit`. With no
+displaced controller it may remain resident. When training or background work
+was displaced, the broker unloads the configured model container and proves it
+absent before restoring that work. Batch/3D work uses an exclusive lease. A
+resident different profile prevents admission. This release does not accept
+live shared-mode certifications.
 
 ## Persistence
 
@@ -95,9 +98,11 @@ SQLite stores requests, jobs, events, artifact metadata, idempotency keys, and
 route history. Artifact bytes live in the configured data directory and enter
 the registry by atomic rename after size and digest verification.
 
-On process start, the coordinator first acquires the host lock, advances its
-epoch, reconciles stale fences and resource observations, and only then marks
-unattached active jobs `interrupted`. It never guesses that GPU work completed
+On process start, the coordinator first acquires the host lock, atomically
+advances its durable epoch, reconciles stale fences through a new-epoch takeover
+and resource observations, and only then marks unattached active jobs
+`interrupted`. A quarantined broker still serves authenticated status and
+artifacts while rejecting new jobs. It never guesses that GPU work completed
 or that a database lease proves physical release. A repeated idempotency key
 returns the durable record for the original request. A changed payload with the
 same key conflicts.

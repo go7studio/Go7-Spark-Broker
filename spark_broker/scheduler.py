@@ -8,7 +8,7 @@ from typing import Any
 from . import PROTOCOL_VERSION
 from .contract import ContractError
 from .executors import ExecutionCancelled, ExecutionFailure, Executor
-from .artifacts import ArtifactRegistry
+from .artifacts import ArtifactError, ArtifactRegistry
 from .store import Store
 from .resources import AdmissionDeferred, ExecutionControl, ExecutionPlan, LeaseHandle, ResourceCoordinator
 
@@ -35,6 +35,7 @@ class Scheduler:
         self._state_lock = threading.Lock()
         self._active_job: str | None = None
         self._active_profile: str | None = None
+        self._active_profile_state: str | None = None
         self._profile_loaded_at: float | None = None
         self._active_priority: int | None = None
         self._active_plan: ExecutionPlan | None = None
@@ -57,6 +58,14 @@ class Scheduler:
             self._thread.join(timeout)
         if self._control_thread:
             self._control_thread.join(timeout)
+        alive = [
+            thread.name for thread in (self._thread, self._control_thread)
+            if thread is not None and thread.is_alive()
+        ]
+        if alive:
+            raise RuntimeError(
+                "scheduler did not stop; resource coordinator ownership is retained: " + ", ".join(alive)
+            )
 
     def notify(self) -> None:
         self._wake.set()
@@ -67,6 +76,7 @@ class Scheduler:
             value = {
                 "activeJobId": self._active_job,
                 "activeProfileId": self._active_profile,
+                "activeProfileState": self._active_profile_state,
                 "profileLoadedAtMonotonic": self._profile_loaded_at,
                 "schedulerAlive": bool(self._thread and self._thread.is_alive()),
                 "controlLoopAlive": bool(self._control_thread and self._control_thread.is_alive()),
@@ -88,6 +98,9 @@ class Scheduler:
                     self._wake.clear()
                     continue
                 self._execute(job)
+        except BaseException:
+            self._stop.set()
+            self._control_wake.set()
         finally:
             self.store.close()
 
@@ -102,11 +115,39 @@ class Scheduler:
                     control = self._active_control
                 if active_priority is None or plan is None or control is None:
                     continue
-                queued = self.store.peek_next(set(self.executors))
-                if not queued or queued["priority"] <= active_priority:
+                if plan.preemption_mode != "checkpoint":
                     continue
-                if plan.preemption_mode == "checkpoint":
-                    control.request_yield(f"higher_priority_job:{queued['id']}")
+                routing_context = self.coordinator.routing_context() if self.coordinator else None
+                offset = 0
+                found = False
+                while not found:
+                    queued_page = self.store.peek_queued(set(self.executors), limit=100, offset=offset)
+                    if not queued_page:
+                        break
+                    for queued in queued_page:
+                        if queued["priority"] <= active_priority:
+                            found = True
+                            break
+                        try:
+                            self._check_deadline(queued)
+                            candidate_executor = self.executors[queued["capability"]]
+                            candidate_executor.validate_request(queued, self.registry)
+                            candidate = candidate_executor.plan(queued, routing_context)
+                        except (ArtifactError, ContractError, OSError, ValueError):
+                            continue
+                        if candidate.service_class != "interactive":
+                            continue
+                        if self.coordinator and not self.coordinator.preemption_candidate(candidate):
+                            continue
+                        control.request_yield(f"higher_priority_interactive_job:{queued['id']}")
+                        found = True
+                        break
+                    if len(queued_page) < 100:
+                        break
+                    offset += len(queued_page)
+        except BaseException:
+            self._stop.set()
+            self._wake.set()
         finally:
             self.store.close()
 
@@ -114,6 +155,9 @@ class Scheduler:
         executor = self.executors[job["capability"]]
         lease: LeaseHandle | None = None
         plan: ExecutionPlan | None = None
+        execution_performed = False
+        activated = False
+        release_attempted = False
         with self._state_lock:
             self._active_job = job["id"]
             self._active_priority = job["priority"]
@@ -138,20 +182,27 @@ class Scheduler:
             self.store.transition(job["id"], "loading", detail={"plan": plan.public()}, profile_id=plan.profile_id)
             if self.coordinator:
                 lease = self.coordinator.acquire(job, plan, control)
+            activated = True
             executor.activate_plan(plan, control)
+            if self.coordinator:
+                self.coordinator.verify_activation(lease, plan)
             with self._state_lock:
                 self._active_profile = plan.profile_id
+                self._active_profile_state = "active"
                 self._profile_loaded_at = time.monotonic()
             payload = executor.execute_plan(plan, job, self.registry, control, stage)
+            execution_performed = True
             if control():
                 raise ExecutionCancelled("job was cancelled")
-            if control.yield_requested():
+            if payload.get("data", {}).get("outcome") == "yielded":
                 raise ExecutionFailure(
                     "yield_protocol_unsupported",
                     "executor yielded, but protocol 1.0 cannot represent a resumable training run safely",
                     retryable=False,
                 )
+            activated = not executor.deactivate_plan(plan)
             if self.coordinator:
+                release_attempted = True
                 self.coordinator.release(lease)
                 lease = None
             request = job["request"]
@@ -167,8 +218,23 @@ class Scheduler:
         except AdmissionDeferred as exc:
             if exc.code == "cancelled":
                 self.store.fail(job["id"], {"code": "cancelled", "message": str(exc), "retryable": False}, status="cancelled")
+            elif execution_performed:
+                # Never replay a workload that may already have produced
+                # external side effects merely because release verification
+                # failed. The lease remains unknown/quarantined for operator
+                # reconciliation and the job records the uncertain outcome.
+                self.store.fail(job["id"], {
+                    "code": "resource_release_uncertain",
+                    "message": str(exc),
+                    "retryable": False,
+                    "detail": {"releaseCode": exc.code, **exc.detail},
+                })
             else:
-                self.store.defer(job["id"], detail={"code": exc.code, "message": str(exc), **exc.detail})
+                self.store.defer(
+                    job["id"],
+                    detail={"code": exc.code, "message": str(exc), **exc.detail},
+                    delay_seconds=exc.retry_after_seconds,
+                )
                 self._wake.wait(exc.retry_after_seconds)
                 self._wake.clear()
         except ExecutionCancelled as exc:
@@ -180,8 +246,14 @@ class Scheduler:
         except BaseException as exc:
             self.store.fail(job["id"], {"code": "internal_error", "message": f"executor failed: {type(exc).__name__}", "retryable": False})
         finally:
-            if lease is not None and self.coordinator:
+            if activated and plan is not None:
                 try:
+                    activated = not executor.deactivate_plan(plan)
+                except (ExecutionFailure, OSError):
+                    pass
+            if lease is not None and self.coordinator and not release_attempted:
+                try:
+                    release_attempted = True
                     self.coordinator.release(lease)
                 except AdmissionDeferred:
                     pass
@@ -190,6 +262,12 @@ class Scheduler:
                 self._active_priority = None
                 self._active_plan = None
                 self._active_control = None
+                if activated:
+                    self._active_profile_state = "resident_or_unknown"
+                else:
+                    self._active_profile = None
+                    self._active_profile_state = None
+                    self._profile_loaded_at = None
 
     @staticmethod
     def _check_deadline(job: dict[str, Any]) -> None:

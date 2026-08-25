@@ -11,15 +11,16 @@ An administrator may connect an existing training controller through
 
 1. validates the request and selects an installed inference profile;
 2. records a fenced GPU permit;
-3. asks the training controller for its configured target mode;
-4. waits for the matching generation acknowledgement;
+3. asks the training controller to checkpoint and release its GPU profile;
+4. requires a safe-boundary acknowledgement and immutable checkpoint digest;
 5. re-samples unified-memory and runtime ownership;
 6. admits inference only if the incompatible training profile has released; and
-7. restores the controller's normal mode before releasing the permit.
+7. unloads and verifies the inference profile absent; and
+8. uses a new fenced acknowledgement to restore the controller's normal mode.
 
 If the controller merely reduces compute while training remains resident, the
-inference request stays queued. That is intentional until the exact runtime pair
-passes a digest-bound shared-mode certification.
+inference request stays queued. Live co-residency is intentionally disabled
+until the exact runtime pair passes a digest-bound shared-mode certification.
 
 ## Required managed-training contract
 
@@ -73,4 +74,3 @@ process, CUDA context, or unified-memory allocation disappeared.
 - unknown GPU consumer quarantine without termination;
 - continuous interactive traffic and explicit training-starvation policy; and
 - digest/runtime changes invalidating every shared-mode certification.
-

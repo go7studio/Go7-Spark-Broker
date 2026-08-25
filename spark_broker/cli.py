@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from . import PROTOCOL_VERSION
-from .client import BrokerClient, ClientError
+from .client import BrokerClient, ClientError, read_credential
 
 
 TERMINAL = {"completed", "failed", "cancelled", "interrupted"}
@@ -20,7 +20,7 @@ TERMINAL = {"completed", "failed", "cancelled", "interrupted"}
 def client_from_args(args: argparse.Namespace) -> BrokerClient:
     token = args.token or os.environ.get("SPARK_BROKER_TOKEN", "")
     if not token and args.token_file:
-        token = Path(args.token_file).read_text(encoding="utf-8").strip()
+        token = read_credential(Path(args.token_file))
     if not token:
         raise SystemExit("set SPARK_BROKER_TOKEN or pass --token-file")
     return BrokerClient(args.url, token, timeout=args.timeout)

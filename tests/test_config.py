@@ -31,6 +31,22 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.text_model, "")
         self.assertEqual(config.text_profile_id, "gpu.openai-compatible")
         self.assertEqual(config.text_estimated_memory_gb, 0)
+        self.assertIsNone(config.coordinator_lock_file)
+
+    def test_host_coordinator_lock_path_is_configurable_independently_of_data(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            token = self.credential(directory, "broker-token", "t" * 32)
+            lock_file = Path(directory) / "host-gpu0.lock"
+            epoch_file = Path(directory) / "host-gpu0.epoch"
+            with patch.dict(os.environ, {
+                "SPARK_BROKER_TOKEN_FILE": token,
+                "SPARK_BROKER_DATA": str(Path(directory) / "data"),
+                "SPARK_COORDINATOR_LOCK_FILE": str(lock_file),
+                "SPARK_COORDINATOR_EPOCH_FILE": str(epoch_file),
+            }, clear=True):
+                config = Config.from_env()
+        self.assertEqual(config.coordinator_lock_file, lock_file)
+        self.assertEqual(config.coordinator_epoch_file, epoch_file)
 
     def test_generic_openai_configuration_is_self_describing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

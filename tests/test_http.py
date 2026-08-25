@@ -22,6 +22,18 @@ class StartupCleanupProbe:
         self.calls += 1
 
 
+class QuarantinedCoordinator:
+    def __init__(self) -> None:
+        self.quarantined = True
+        self.stopped = False
+
+    def start(self) -> None:
+        return None
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
 class HTTPTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -100,6 +112,26 @@ class BrokerStartupTests(unittest.TestCase):
                 self.assertEqual(probe.calls, 1)
             finally:
                 broker.stop()
+
+    def test_broker_does_not_cleanup_workloads_when_reconciliation_is_quarantined(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(
+                broker_id="spark.test", bind="127.0.0.1", port=0, token="t" * 32,
+                data_root=Path(directory), hunyuan_root=None, stop_containers=(), max_artifact_bytes=1024 * 1024,
+            )
+            broker = Broker(config)
+            probe = StartupCleanupProbe()
+            coordinator = QuarantinedCoordinator()
+            broker.executors = {"probe": probe}  # type: ignore[assignment]
+            broker.scheduler.executors = broker.executors
+            broker.coordinator = coordinator  # type: ignore[assignment]
+            broker.start()
+            try:
+                self.assertEqual(probe.calls, 0)
+                self.assertFalse(broker.scheduler.status()["schedulerAlive"])
+            finally:
+                broker.stop()
+            self.assertTrue(coordinator.stopped)
 
 
 if __name__ == "__main__":
