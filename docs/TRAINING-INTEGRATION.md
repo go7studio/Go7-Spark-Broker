@@ -1,8 +1,9 @@
 # Training integration
 
-This repository coordinates inference today and provides the fenced governor
-boundary required to keep independent training from racing it. It does not yet
-advertise a managed training capability.
+This repository coordinates inference today and ships a fenced,
+checkpoint-aware lifecycle controller for an independently installed systemd
+user training service. It does not yet advertise a managed training
+capability.
 
 ## Current safe path
 
@@ -21,6 +22,57 @@ An administrator may connect an existing training controller through
 If the controller merely reduces compute while training remains resident, the
 inference request stays queued. Live co-residency is intentionally disabled
 until the exact runtime pair passes a digest-bound shared-mode certification.
+
+## Shipped lifecycle controller
+
+`spark-training-controller` exposes only the two authenticated loopback
+operations required by the resource governor. Its administrator-owned config
+fixes one systemd user unit, controller/profile identity, mode pair, checkpoint
+root, receipt, and state paths. A caller cannot select commands, units,
+endpoints, or filesystem paths.
+
+Copy `examples/training-controller.example.json` outside the checkout and make
+the config and bearer credential mode `0600`. The system template
+`systemd/go7-spark-training-controller@.service` runs the controller as the
+same dedicated account that owns the training user unit. The controller:
+
+- persists the request before changing the unit;
+- recovers an interrupted transition on restart;
+- enforces broker epoch, lease, fence, and control-generation ordering;
+- stops the fixed unit and verifies it inactive before releasing the profile;
+- hashes every receipt member and rejects symlinks, traversal, missing files,
+  size mismatches, or digest changes;
+- persists the receipt identity observed immediately before stopping and
+  requires a same-run, newer checkpoint identity on every release, including
+  first controller use and crash recovery, and refuses an ID-only bump whose
+  file manifest evidence did not change; and
+- revalidates the exact prior checkpoint before resuming the unit.
+
+The trainer must publish a new owner-only receipt matching
+`examples/checkpoint-receipt.example.json` as part of its graceful stop path.
+Every listed path is relative to the configured checkpoint root. The receipt
+is only accepted after every file is durable and immutable. A generic
+`SIGINT`, an unchanged checkpoint pointer, or an inactive process without a
+new verified receipt fails closed.
+
+Do not set `allowFreshStart` in a production integration unless the installed
+trainer separately proves that starting without a checkpoint is intentional.
+The controller does not interpret framework-specific checkpoint formats, so an
+exact next-step resume test remains an administrator certification gate.
+
+### Always-resident inference constraint
+
+Protocol 1.0 cannot combine this rotation controller with an inference process
+that is required to remain GPU-resident. Before the broker restores training,
+it must unload the selected inference profile and prove it absent. Broker
+startup therefore rejects a controller-backed configuration whose inference
+profile has no managed unload lifecycle. If a container lifecycle is supplied,
+the broker stops that container after the bounded inference window.
+
+Consequently, do not attach this controller to an always-resident Qwen service.
+Keep the controller disarmed while Qwen remains resident. A smaller baseline
+model may be evaluated for certified coexistence, but CUDA headroom alone is
+not certification and `sharedCertifications` remains rejected in protocol 1.0.
 
 ## Required managed-training contract
 

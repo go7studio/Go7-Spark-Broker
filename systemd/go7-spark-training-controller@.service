@@ -1,0 +1,30 @@
+[Unit]
+Description=Go7 Spark checkpoint-and-release training controller for %i
+After=network-online.target user@%U.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+StateDirectory=go7-spark-training-controller/%i
+StateDirectoryMode=0700
+Environment=SPARK_TRAINING_CONTROLLER_BIND=127.0.0.1
+Environment=SPARK_TRAINING_CONTROLLER_PORT=9001
+Environment=SPARK_TRAINING_CONTROLLER_CONFIG=/etc/go7-spark-training-controller/%i.json
+Environment=SPARK_TRAINING_CONTROLLER_TOKEN_FILE=/etc/go7-spark-training-controller/%i.token
+ExecStart=/opt/go7-spark-broker/venv/bin/spark-training-controller
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/go7-spark-training-controller/%i
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

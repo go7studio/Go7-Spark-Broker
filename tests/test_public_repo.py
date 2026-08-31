@@ -87,6 +87,9 @@ class PublicRepositoryTests(unittest.TestCase):
             "examples/resource-policy.example.json",
             "examples/resource-probe.example.json",
             "examples/controller-state.example.json",
+            "examples/training-controller.example.json",
+            "examples/checkpoint-receipt.example.json",
+            "systemd/go7-spark-training-controller@.service",
             "docs/RESOURCE-GOVERNOR.md",
             "docs/RESOURCE-PROBE.md",
             "docs/TRAINING-INTEGRATION.md",
@@ -134,6 +137,7 @@ class PublicRepositoryTests(unittest.TestCase):
         ))
         self.assertTrue(policy.require_probe)
         self.assertTrue(policy.enforce_memory_admission)
+        self.assertTrue(policy.enforce_cuda_admission)
         self.assertEqual(policy.controllers[0].workload_kind, "training")
         self.assertTrue(policy.controllers[0].requires_checkpoint)
         self.assertEqual(policy.controllers[0].timeout_seconds, 600)
@@ -146,6 +150,21 @@ class PublicRepositoryTests(unittest.TestCase):
         )
         self.assertEqual(controller_state["controllerId"], policy.controllers[0].id)
         self.assertRegex(controller_state["mutationId"], r"^mutation_[a-f0-9]{32}$")
+        training_controller = json.loads(
+            (ROOT / "examples/training-controller.example.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(training_controller["controllerId"], policy.controllers[0].id)
+        self.assertEqual(training_controller["profileId"], policy.controllers[0].profile_id)
+        self.assertEqual(training_controller["releasedMode"], policy.controllers[0].throttled_mode)
+        self.assertEqual(
+            training_controller["stateFile"],
+            str(probe.controller_state_files[0].path),
+        )
+        receipt = json.loads(
+            (ROOT / "examples/checkpoint-receipt.example.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(receipt["version"], 1)
+        self.assertRegex(receipt["files"][0]["sha256"], r"^[a-f0-9]{64}$")
 
 
 if __name__ == "__main__":

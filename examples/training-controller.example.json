@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "controllerId": "background-workload",
+  "profileId": "gpu.background-training",
+  "unit": "installed-training.service",
+  "normalMode": "normal",
+  "releasedMode": "checkpoint-release",
+  "checkpointRoot": "/absolute/path/to/immutable-checkpoints",
+  "checkpointReceiptFile": "/absolute/path/to/immutable-checkpoints/latest-receipt.json",
+  "stateFile": "/var/lib/go7-spark-training-controller/service-account/controller-state.json",
+  "authorityFile": "/var/lib/go7-spark-training-controller/service-account/controller-authority.json",
+  "allowFreshStart": false,
+  "stopTimeoutSeconds": 600
+}

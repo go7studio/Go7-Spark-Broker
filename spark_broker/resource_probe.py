@@ -10,6 +10,7 @@ import re
 import socket
 import stat
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -57,6 +58,7 @@ class ProbePolicy:
     owner_id: str
     profiles: tuple[InstalledProfile, ...]
     controller_state_files: tuple[ControllerStateFile, ...] = ()
+    cuda_memory_probe: bool = False
 
     @classmethod
     def from_bytes(cls, raw: bytes) -> "ProbePolicy":
@@ -67,10 +69,14 @@ class ProbePolicy:
         if (
             not isinstance(value, dict)
             or not {"version", "ownerId", "profiles"}.issubset(value)
-            or set(value) - {"version", "ownerId", "profiles", "controllerStateFiles"}
+            or set(value) - {
+                "version", "ownerId", "profiles", "controllerStateFiles",
+                "cudaMemoryProbe",
+            }
         ):
             raise ProbeConfigError(
-                "probe config must contain version, ownerId, profiles, and optional controllerStateFiles"
+                "probe config must contain version, ownerId, profiles, and optional "
+                "controllerStateFiles and cudaMemoryProbe"
             )
         if value["version"] != 1:
             raise ProbeConfigError("probe config version must be 1")
@@ -128,10 +134,14 @@ class ProbePolicy:
             state_files.append(ControllerStateFile(controller_id, Path(state_file)))
         if len({item.id for item in state_files}) != len(state_files):
             raise ProbeConfigError("controller state file ids must be unique")
+        cuda_memory_probe = value.get("cudaMemoryProbe", False)
+        if not isinstance(cuda_memory_probe, bool):
+            raise ProbeConfigError("cudaMemoryProbe must be boolean")
         return cls(
             owner_id=owner_id,
             profiles=tuple(profiles),
             controller_state_files=tuple(state_files),
+            cuda_memory_probe=cuda_memory_probe,
         )
 
 
@@ -249,6 +259,49 @@ def run_command(argv: tuple[str, ...]) -> str:
     if len(completed.stdout) > 4 * 1024 * 1024:
         raise RuntimeError(f"{argv[0]} output exceeded 4 MiB")
     return completed.stdout
+
+
+def run_cuda_memory_probe() -> dict[str, int]:
+    """Query a short-lived CUDA process without making this daemon a GPU consumer."""
+
+    helper = Path(__file__).with_name("cuda_memory_probe.py")
+    environment = {
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "LC_ALL": "C",
+    }
+    completed = subprocess.run(
+        (sys.executable, str(helper)),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=10,
+        check=False,
+        env=environment,
+    )
+    if completed.returncode != 0:
+        message = completed.stderr.strip()[:256] or f"exit {completed.returncode}"
+        raise RuntimeError(f"CUDA memory probe failed: {message}")
+    if len(completed.stdout) > 4096:
+        raise RuntimeError("CUDA memory probe output exceeded 4 KiB")
+    try:
+        value = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("CUDA memory probe returned invalid JSON") from exc
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"allocatableBytes", "addressSpaceTotalBytes"}
+        or any(
+            not isinstance(value.get(field), int)
+            or isinstance(value.get(field), bool)
+            or value[field] < 0
+            for field in value
+        )
+        or value["addressSpaceTotalBytes"] <= 0
+        or value["allocatableBytes"] > value["addressSpaceTotalBytes"]
+    ):
+        raise RuntimeError("CUDA memory probe returned an invalid envelope")
+    return value
 
 
 class LinuxProcessReader:
@@ -419,6 +472,7 @@ class ResourceInventory:
         meminfo_path: Path = Path("/proc/meminfo"),
         pressure_path: Path = Path("/proc/pressure/memory"),
         monotonic: Callable[[], float] = time.monotonic,
+        cuda_memory_probe: Callable[[], dict[str, int]] = run_cuda_memory_probe,
     ) -> None:
         self.policy = policy
         self.generation_store = generation_store
@@ -427,11 +481,34 @@ class ResourceInventory:
         self.meminfo_path = meminfo_path
         self.pressure_path = pressure_path
         self.monotonic = monotonic
+        self.cuda_memory_probe = cuda_memory_probe
 
     def snapshot(self) -> dict[str, Any]:
         generation = self.generation_store.next()
         metrics, metric_errors = self._host_metrics()
         errors: list[str] = list(metric_errors)
+        if self.policy.cuda_memory_probe:
+            try:
+                cuda_memory = self.cuda_memory_probe()
+                allocatable = cuda_memory["allocatableBytes"]
+                total = cuda_memory["addressSpaceTotalBytes"]
+                if (
+                    not isinstance(allocatable, int)
+                    or isinstance(allocatable, bool)
+                    or not isinstance(total, int)
+                    or isinstance(total, bool)
+                    or allocatable < 0
+                    or total <= 0
+                    or allocatable > total
+                ):
+                    raise ValueError("invalid CUDA memory envelope")
+            except Exception:
+                metrics["cudaAllocatableBytes"] = None
+                metrics["cudaAddressSpaceTotalBytes"] = None
+                errors.append("cuda_memory_unobservable")
+            else:
+                metrics["cudaAllocatableBytes"] = allocatable
+                metrics["cudaAddressSpaceTotalBytes"] = total
         runtimes: list[_Runtime] = []
         for profile in self.policy.profiles:
             try:

@@ -35,6 +35,9 @@ mode-restricted environment file. See [ARCHITECTURE.md](ARCHITECTURE.md).
 - An optional authenticated, read-only resource probe that binds CUDA PIDs to
   pinned Docker images or systemd user-unit executables and fails closed on
   unknown consumers. See [Resource probe](docs/RESOURCE-PROBE.md).
+- An optional fenced training lifecycle controller that can stop one fixed
+  systemd user unit only after a new immutable checkpoint receipt is verified,
+  and can resume it only after the same checkpoint is revalidated.
 - Multi-profile inference routing by advertised model identity, service class,
   administrator priority, measured health, residency, or memory preference.
 - Dynamic capability discovery. Unconfigured adapters are absent.
@@ -204,14 +207,29 @@ SPARK_RESOURCE_POLICY_FILE=/absolute/path/to/resource-policy.json
 
 The resource policy and every referenced bearer credential are also
 service-account-owned, regular, non-symlink files with mode `0600` or stricter.
+On a unified-memory GPU, enable `cudaMemoryProbe` in the probe inventory and
+`enforceCudaAdmission` in the resource policy. GPU capability startup requires
+both host-memory and CUDA admission. The two envelopes are independent: Linux
+`MemAvailable` includes reclaimable cache, while the short-lived CUDA process
+measurement reflects what the driver can allocate now. Configure both
+`hostReserveGb` and `cudaReserveGb`; missing CUDA telemetry then fails closed
+instead of treating dashboard headroom as allocatable GPU memory.
 
 The governor contract uses a broker lease ID, explicit durable broker epoch,
 fence, control generation, random mutation identity, and probe-observed
-controller state. Training
-controllers must prove a durable checkpoint boundary. The broker re-reads the
+controller state. The shipped `spark-training-controller` is a generic
+checkpoint-and-release implementation for one administrator-installed systemd
+user training service; see
+[Training integration](docs/TRAINING-INTEGRATION.md). Training controllers must
+prove a durable checkpoint boundary. The broker re-reads the
 resource snapshot after control and activation, unloads the selected model
 before restoring displaced work, and refuses incompatible coexistence. See
 [Resource governor protocol](docs/RESOURCE-GOVERNOR.md).
+
+That unload requirement means controller-backed rotation is not compatible
+with an inference process that must remain GPU-resident. Leave the training
+controller disarmed for an always-resident Qwen deployment until an exact
+smaller-model/runtime pair passes a future shared-mode certification.
 
 Optional Hunyuan3D adapter:
 

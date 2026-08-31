@@ -38,17 +38,24 @@ class FakeHostProbe:
 
 
 class FakeControlClient:
-    def __init__(self, *, unknown_consumers: int = 0, active_profiles: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        unknown_consumers: int = 0,
+        active_profiles: list[str] | None = None,
+        cuda_allocatable_gb: int | None = None,
+    ) -> None:
         self.unknown_consumers = unknown_consumers
         self.active_profiles = active_profiles or []
         self.calls: list[dict] = []
         self.generation = 6
         self.controller_states: dict[str, dict] = {}
+        self.cuda_allocatable_gb = cuda_allocatable_gb
 
     def snapshot(self, endpoint, token_file):
         del endpoint, token_file
         self.generation += 1
-        return {
+        value = {
             "health": "healthy", "unknownConsumers": self.unknown_consumers,
             "activeProfiles": self.active_profiles,
             "profiles": {
@@ -63,6 +70,12 @@ class FakeControlClient:
             "controllerStates": self.controller_states,
             "generation": self.generation,
         }
+        if self.cuda_allocatable_gb is not None:
+            value["metrics"] = {
+                "cudaAllocatableBytes": self.cuda_allocatable_gb * 1024**3,
+                "cudaAddressSpaceTotalBytes": 128 * 1024**3,
+            }
+        return value
 
     def set_mode(
         self, controller, *, mutation_id, mode, lease_id, fencing_token,
@@ -339,6 +352,103 @@ class ResourceCoordinatorTests(unittest.TestCase):
             self.assertEqual(context.exception.code, "insufficient_memory")
         finally:
             coordinator.stop()
+
+    def test_cuda_envelope_requires_workload_plus_device_reserve(self) -> None:
+        policy = replace(
+            self.policy(),
+            enforce_cuda_admission=True,
+            cuda_reserve_gb=4,
+        )
+        coordinator = ResourceCoordinator(
+            store=self.store,
+            data_root=self.root,
+            policy=policy,
+            host_probe=FakeHostProbe(available_gb=120),
+            control_client=FakeControlClient(cuda_allocatable_gb=35),
+        )
+        coordinator.start()
+        try:
+            with self.assertRaises(AdmissionDeferred) as context:
+                coordinator.acquire(self.job, self.plan(), lambda: False)
+            self.assertEqual(context.exception.code, "insufficient_cuda_memory")
+            self.assertEqual(context.exception.detail["requiredGb"], 36)
+        finally:
+            coordinator.stop()
+
+    def test_required_cuda_envelope_fails_closed_when_probe_omits_it(self) -> None:
+        policy = replace(self.policy(), enforce_cuda_admission=True)
+        coordinator = ResourceCoordinator(
+            store=self.store,
+            data_root=self.root,
+            policy=policy,
+            host_probe=FakeHostProbe(available_gb=120),
+            control_client=FakeControlClient(),
+        )
+        coordinator.start()
+        try:
+            with self.assertRaises(AdmissionDeferred) as context:
+                coordinator.acquire(self.job, self.plan(), lambda: False)
+            self.assertEqual(context.exception.code, "cuda_memory_unknown")
+        finally:
+            coordinator.stop()
+
+    def test_cuda_envelope_admits_with_certified_headroom(self) -> None:
+        policy = replace(
+            self.policy(), enforce_cuda_admission=True, cuda_reserve_gb=4
+        )
+        coordinator = ResourceCoordinator(
+            store=self.store,
+            data_root=self.root,
+            policy=policy,
+            host_probe=FakeHostProbe(available_gb=120),
+            control_client=FakeControlClient(cuda_allocatable_gb=40),
+        )
+        coordinator.start()
+        try:
+            handle = coordinator.acquire(self.job, self.plan(), lambda: False)
+            coordinator.release(handle)
+        finally:
+            coordinator.stop()
+
+    def test_resident_profile_must_preserve_cuda_reserve(self) -> None:
+        policy = replace(
+            self.policy(),
+            controllers=(),
+            enforce_cuda_admission=True,
+            cuda_reserve_gb=4,
+        )
+        coordinator = ResourceCoordinator(
+            store=self.store,
+            data_root=self.root,
+            policy=policy,
+            host_probe=FakeHostProbe(available_gb=120),
+            control_client=FakeControlClient(
+                active_profiles=["gpu.interactive"],
+                cuda_allocatable_gb=3,
+            ),
+        )
+        coordinator.start()
+        try:
+            with self.assertRaises(AdmissionDeferred) as context:
+                coordinator.acquire(self.job, self.plan(), lambda: False)
+            self.assertEqual(context.exception.code, "insufficient_cuda_memory")
+            self.assertEqual(context.exception.detail["requiredGb"], 4)
+            self.assertTrue(context.exception.detail["resident"])
+        finally:
+            coordinator.stop()
+
+    def test_cuda_policy_fields_are_closed_and_typed(self) -> None:
+        policy = ResourcePolicy.from_value({
+            "version": 1,
+            "enforceCudaAdmission": True,
+            "cudaReserveGb": 4,
+        })
+        self.assertTrue(policy.enforce_cuda_admission)
+        self.assertEqual(policy.cuda_reserve_gb, 4)
+        with self.assertRaisesRegex(ValueError, "cudaReserveGb"):
+            ResourcePolicy.from_value({"version": 1, "cudaReserveGb": -1})
+        with self.assertRaisesRegex(ValueError, "enforceCudaAdmission"):
+            ResourcePolicy.from_value({"version": 1, "enforceCudaAdmission": 1})
 
     def test_os_lock_prevents_two_mutating_coordinators(self) -> None:
         first = ResourceCoordinator(store=self.store, data_root=self.root)

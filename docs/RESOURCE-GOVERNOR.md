@@ -6,6 +6,23 @@ GPU capabilities fail closed unless the broker has all three of these:
 - a durable host-wide epoch file outside `/tmp`, `/var/tmp`, and per-user runtime directories; and
 - a required, healthy resource probe with unified-memory admission enabled.
 
+Every installed GPU capability requires both host-memory and short-lived CUDA
+process admission. Linux `MemAvailable` includes
+reclaimable cache and is not a promise that the CUDA driver can satisfy a new
+allocation. With both gates enabled, admission requires:
+
+- `MemAvailable >= hostReserveGb + estimatedMemoryGb` for a non-resident
+  profile, or at least `hostReserveGb` for a resident profile;
+- `cudaAllocatableBytes >= cudaReserveGb + estimatedMemoryGb` for a
+  non-resident profile; and
+- `cudaAllocatableBytes >= cudaReserveGb` for a resident profile.
+
+The second value comes from the probe's short-lived CUDA Driver API helper.
+Missing or malformed CUDA telemetry fails closed. The CUDA reserve covers
+allocator variance, context overhead, and measurement skew; it is not a shared
+profile certification and does not permit otherwise incompatible profiles to
+co-reside.
+
 The operating-system lock prevents two live broker processes using the same
 path from mutating GPU 0 concurrently. It is not durable after process death.
 The persistent epoch, fenced controller protocol, and observed resource probe

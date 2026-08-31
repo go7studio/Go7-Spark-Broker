@@ -1,8 +1,10 @@
 {
   "version": 1,
   "hostReserveGb": 16,
+  "cudaReserveGb": 4,
   "maximumMemoryPressureAvg10": 5,
   "enforceMemoryAdmission": true,
+  "enforceCudaAdmission": true,
   "maximumInferenceWindowSeconds": 300,
   "probe": {
     "endpoint": "http://127.0.0.1:9000",
@@ -12,7 +14,7 @@
   "controllers": [
     {
       "id": "background-workload",
-      "profileId": "gpu.background-workload",
+      "profileId": "gpu.background-training",
       "workloadKind": "training",
       "endpoint": "http://127.0.0.1:9001",
       "tokenFile": "/absolute/path/to/background-controller-key",

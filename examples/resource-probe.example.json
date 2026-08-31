@@ -1,6 +1,7 @@
 {
   "version": 1,
   "ownerId": "spark.probe",
+  "cudaMemoryProbe": true,
   "profiles": [
     {
       "id": "gpu.local-text",
@@ -18,7 +19,7 @@
   "controllerStateFiles": [
     {
       "id": "background-workload",
-      "stateFile": "/var/lib/go7-spark-controller/background-workload-state.json"
+      "stateFile": "/var/lib/go7-spark-training-controller/service-account/controller-state.json"
     }
   ]
 }

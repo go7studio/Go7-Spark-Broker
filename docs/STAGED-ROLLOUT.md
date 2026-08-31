@@ -52,6 +52,8 @@ Do not enable a GPU capability until every item below is true:
 
 - the read-only resource probe identifies every CUDA PID and binds it to an
   administrator-installed immutable runtime identity;
+- unified-memory admission passes both the host `MemAvailable` envelope and a
+  short-lived CUDA process allocation envelope, each with an explicit reserve;
 - no legacy or second coordinator can mutate the same GPU outside the shared
   host lock, epoch, lease, fence, mutation-observation, and probe-generation domain;
 - an inference gateway closes admission and drains accepted in-flight calls

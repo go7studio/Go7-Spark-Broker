@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "runId": "run-opaque",
+  "checkpointId": "checkpoint-opaque",
+  "files": [
+    {
+      "path": "checkpoint-opaque/model-and-training-state.bin",
+      "size": 123456789,
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ]
+}

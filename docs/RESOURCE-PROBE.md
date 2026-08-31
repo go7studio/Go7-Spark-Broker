@@ -31,6 +31,8 @@ The probe:
   `unknownConsumers`;
 - reports missing GPU enumeration as a synthetic unknown consumer;
 - reports typed DGX unified-memory and memory-PSI measurements; and
+- optionally measures the bytes available to a new short-lived CUDA process in a
+  short-lived child process, so the observer does not retain a GPU context; and
 - reads controller-published, mode-restricted mutation-state files so the
   broker can causally bind acknowledgements to observed inventory; and
 - advances an atomically persisted, host-local snapshot generation for every
@@ -41,13 +43,22 @@ an active profile. A positive `unknownConsumers`, degraded health, missing UMA
 metrics, or missing PSI closes broker GPU admission. The probe never kills or
 pauses an unknown process.
 
+When `cudaMemoryProbe` is enabled, a failed CUDA Driver API measurement also
+degrades the snapshot. The measurement answers a different question from
+Linux `MemAvailable`: it reports what a new CUDA context can allocate at that
+moment after driver reservations and current contexts are accounted for. On a
+unified-memory host both gates are required for a new profile. Reclaimable
+Linux cache can make `MemAvailable` materially larger than immediately
+CUDA-allocatable memory.
+
 DGX Spark exposes unified CPU/GPU memory and may report device-level
 `memory.used` as `N/A`. In that case the snapshot reports reconciliation as
 unavailable instead of inventing a total. Safety then comes from the union of
 both NVIDIA process inventories, exact PID-to-runtime binding, per-process
-usage where available, host `MemAvailable`/PSI admission, and the separately
-required gateway drain. A host whose driver does expose device totals receives
-the additional residual-memory check automatically.
+usage where available, host `MemAvailable`/PSI admission, the optional fresh-
+context CUDA envelope, and the separately required gateway drain. A host whose
+driver does expose device totals receives the additional residual-memory check
+automatically.
 
 ## Install the inventory
 
@@ -71,6 +82,11 @@ sha256sum "/proc/${pid}/exe"
 The JSON schema is closed: unknown fields, duplicate mappings, mutable tags,
 and non-SHA-256 identities are rejected. Container and unit names are literal
 administrator configuration; requests cannot supply them.
+
+Set `cudaMemoryProbe` to `true` for UMA admission. The helper uses the installed
+CUDA Driver API, creates its context in a short-lived child, records
+`cuMemGetInfo`, releases the primary-context reference, and exits before NVIDIA
+process inventory is sampled. A missing driver or invalid result fails closed.
 
 When resource controllers are installed, add each controller's durable state
 file to `controllerStateFiles`. The controller must atomically replace this
@@ -153,6 +169,8 @@ A healthy response follows the strict resource-governor contract:
     "umaAvailableBytes": 107374182400,
     "swapFreeBytes": 0,
     "memoryPressureSomeAvg10": 0.0,
+    "cudaAllocatableBytes": 85899345920,
+    "cudaAddressSpaceTotalBytes": 137438953472,
     "sampledAtMonotonic": 12345.5
   },
   "observabilityErrors": []

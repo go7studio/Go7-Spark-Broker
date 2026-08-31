@@ -29,8 +29,10 @@ def write_resource_policy(root: Any, endpoint: str) -> Any:
     policy.write_text(json.dumps({
         "version": 1,
         "hostReserveGb": 4,
+        "cudaReserveGb": 4,
         "maximumMemoryPressureAvg10": 5,
         "enforceMemoryAdmission": True,
+        "enforceCudaAdmission": True,
         "probe": {"endpoint": endpoint, "tokenFile": str(token), "required": True},
         "controllers": [],
         "sharedCertifications": [],

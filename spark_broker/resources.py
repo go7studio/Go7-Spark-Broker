@@ -136,8 +136,10 @@ class ControllerPolicy:
 @dataclass(frozen=True)
 class ResourcePolicy:
     host_reserve_gb: float = 16.0
+    cuda_reserve_gb: float = 0.0
     maximum_memory_pressure_avg10: float = 5.0
     enforce_memory_admission: bool = False
+    enforce_cuda_admission: bool = False
     require_probe: bool = False
     probe_endpoint: str | None = None
     probe_token_file: Path | None = None
@@ -160,20 +162,30 @@ class ResourcePolicy:
         allowed = {
             "version", "hostReserveGb", "maximumMemoryPressureAvg10",
             "enforceMemoryAdmission", "probe", "controllers", "sharedCertifications",
-            "maximumInferenceWindowSeconds",
+            "maximumInferenceWindowSeconds", "cudaReserveGb", "enforceCudaAdmission",
         }
         unknown = set(raw) - allowed
         if unknown:
             raise ValueError(f"resource policy has unknown fields: {sorted(unknown)}")
         reserve = raw.get("hostReserveGb", 16)
+        cuda_reserve = raw.get("cudaReserveGb", 0)
         pressure = raw.get("maximumMemoryPressureAvg10", 5)
         enforce = raw.get("enforceMemoryAdmission", False)
+        enforce_cuda = raw.get("enforceCudaAdmission", False)
         if not isinstance(reserve, (int, float)) or isinstance(reserve, bool) or not 1 <= reserve <= 128:
             raise ValueError("hostReserveGb must be 1-128")
         if not isinstance(pressure, (int, float)) or isinstance(pressure, bool) or not 0 <= pressure <= 100:
             raise ValueError("maximumMemoryPressureAvg10 must be 0-100")
+        if (
+            not isinstance(cuda_reserve, (int, float))
+            or isinstance(cuda_reserve, bool)
+            or not 0 <= cuda_reserve <= 128
+        ):
+            raise ValueError("cudaReserveGb must be 0-128")
         if not isinstance(enforce, bool):
             raise ValueError("enforceMemoryAdmission must be boolean")
+        if not isinstance(enforce_cuda, bool):
+            raise ValueError("enforceCudaAdmission must be boolean")
         maximum_window = raw.get("maximumInferenceWindowSeconds")
         if maximum_window is not None and (
             not isinstance(maximum_window, (int, float))
@@ -278,8 +290,10 @@ class ResourcePolicy:
             certifications.append((pair[0], pair[1]))
         return cls(
             host_reserve_gb=float(reserve),
+            cuda_reserve_gb=float(cuda_reserve),
             maximum_memory_pressure_avg10=float(pressure),
             enforce_memory_admission=enforce,
+            enforce_cuda_admission=enforce_cuda,
             require_probe=require_probe,
             probe_endpoint=probe_endpoint,
             probe_token_file=probe_token_file,
@@ -1232,6 +1246,32 @@ class ResourceCoordinator:
                     "resource_probe_invalid",
                     f"resource probe controller state {controller_id} checkpoint is invalid",
                 )
+        metrics = remote.get("metrics")
+        if metrics is not None and not isinstance(metrics, dict):
+            raise AdmissionDeferred(
+                "resource_probe_invalid", "resource probe metrics is invalid"
+            )
+        cuda_allocatable: int | None = None
+        cuda_total: int | None = None
+        if isinstance(metrics, dict):
+            cuda_allocatable = metrics.get("cudaAllocatableBytes")
+            cuda_total = metrics.get("cudaAddressSpaceTotalBytes")
+            if (cuda_allocatable is None) != (cuda_total is None) or (
+                cuda_allocatable is not None
+                and (
+                    not isinstance(cuda_allocatable, int)
+                    or isinstance(cuda_allocatable, bool)
+                    or not isinstance(cuda_total, int)
+                    or isinstance(cuda_total, bool)
+                    or cuda_allocatable < 0
+                    or cuda_total <= 0
+                    or cuda_allocatable > cuda_total
+                )
+            ):
+                raise AdmissionDeferred(
+                    "resource_probe_invalid",
+                    "resource probe CUDA memory envelope is invalid",
+                )
         gpu_memory = remote.get("gpuMemory")
         if gpu_memory is not None:
             expected_gpu_memory_fields = {
@@ -1279,6 +1319,8 @@ class ResourceCoordinator:
             "profiles": profiles,
             "controllerStates": controller_states,
             "gpuMemory": gpu_memory,
+            "cudaAllocatableBytes": cuda_allocatable,
+            "cudaAddressSpaceTotalBytes": cuda_total,
             "probeGeneration": generation,
         }
 
@@ -1293,19 +1335,40 @@ class ResourceCoordinator:
         pressure = snapshot.get("memoryPressureAvg10")
         if pressure is not None and pressure > self.policy.maximum_memory_pressure_avg10:
             raise AdmissionDeferred("memory_pressure", "host memory pressure is above the admission threshold")
-        if not check_capacity or not self.policy.enforce_memory_admission:
+        if not check_capacity:
             return
-        available_bytes = snapshot.get("availableMemoryBytes")
-        if not isinstance(available_bytes, int):
-            raise AdmissionDeferred("memory_unknown", "MemAvailable is unavailable")
         resident = plan.profile_id in snapshot.get("activeProfiles", [])
-        required_gb = self.policy.host_reserve_gb + (0 if resident else plan.estimated_memory_gb)
-        if available_bytes < int(required_gb * 1024**3):
-            raise AdmissionDeferred(
-                "insufficient_memory",
-                "measured unified-memory headroom is below the configured envelope",
-                detail={"requiredGb": required_gb, "availableBytes": available_bytes, "resident": resident},
+        if self.policy.enforce_memory_admission:
+            available_bytes = snapshot.get("availableMemoryBytes")
+            if not isinstance(available_bytes, int):
+                raise AdmissionDeferred("memory_unknown", "MemAvailable is unavailable")
+            required_gb = self.policy.host_reserve_gb + (0 if resident else plan.estimated_memory_gb)
+            if available_bytes < int(required_gb * 1024**3):
+                raise AdmissionDeferred(
+                    "insufficient_memory",
+                    "measured unified-memory headroom is below the configured envelope",
+                    detail={"requiredGb": required_gb, "availableBytes": available_bytes, "resident": resident},
+                )
+        if self.policy.enforce_cuda_admission:
+            cuda_allocatable = snapshot.get("cudaAllocatableBytes")
+            if not isinstance(cuda_allocatable, int) or isinstance(cuda_allocatable, bool):
+                raise AdmissionDeferred(
+                    "cuda_memory_unknown",
+                    "short-lived CUDA process memory is unavailable",
+                )
+            cuda_required_gb = self.policy.cuda_reserve_gb + (
+                0 if resident else plan.estimated_memory_gb
             )
+            if cuda_allocatable < int(cuda_required_gb * 1024**3):
+                raise AdmissionDeferred(
+                    "insufficient_cuda_memory",
+                    "short-lived CUDA process headroom is below the configured envelope",
+                    detail={
+                        "requiredGb": cuda_required_gb,
+                        "allocatableBytes": cuda_allocatable,
+                        "resident": resident,
+                    },
+                )
 
     @staticmethod
     def _released_profile_is_verified(

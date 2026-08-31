@@ -31,6 +31,7 @@ spark-broker = "spark_broker.server:main"
 sparkctl = "spark_broker.cli:main"
 spark-mcp = "spark_broker.mcp_server:main"
 spark-resource-probe = "spark_broker.resource_probe:main"
+spark-training-controller = "spark_broker.training_controller:main"
 
 [tool.setuptools]
 packages = ["spark_broker"]

@@ -180,6 +180,23 @@ class BrokerStartupTests(unittest.TestCase):
             broker = Broker(config)
             broker.store.close()
 
+    def test_gpu_startup_requires_cuda_admission(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy = write_resource_policy(root, "http://127.0.0.1:8791")
+            value = json.loads(policy.read_text(encoding="utf-8"))
+            value["enforceCudaAdmission"] = False
+            policy.write_text(json.dumps(value), encoding="utf-8")
+            policy.chmod(0o600)
+            config = Config(
+                broker_id="spark.test", bind="127.0.0.1", port=0, token="t" * 32,
+                data_root=root / "data", hunyuan_root=None, stop_containers=(),
+                openai_routes_file=self._routes(root, 1), resource_policy_file=policy,
+                coordinator_lock_file=root / "gpu0.lock", coordinator_epoch_file=root / "gpu0.epoch",
+            )
+            with self.assertRaisesRegex(ValueError, "CUDA admission"):
+                Broker(config)
+
     def test_broker_cleans_executor_crash_residue_before_scheduler_start(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = Config(

@@ -2,6 +2,13 @@
 
 ## 0.2.0
 
+- Add short-lived CUDA process memory telemetry and a required second admission
+  envelope for GPU-enabled brokers, preventing reclaimable Linux memory from
+  being mistaken for immediately CUDA-allocatable capacity on unified-memory
+  hosts. CPU-only brokers may leave the probe disabled.
+- Add an authenticated, fenced systemd-user training lifecycle controller with
+  crash recovery, immutable checkpoint receipt verification, checkpoint
+  advancement enforcement, and exact-evidence resume checks.
 - Add a pure, deterministic routing compiler/simulator with canonical config
   revisions shared by production route selection and offline validation.
 - Add an authenticated read-only resource probe with immutable Docker/systemd

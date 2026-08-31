@@ -179,10 +179,14 @@ class Broker:
                 config.resource_policy_file is None
                 or not policy.require_probe
                 or not policy.enforce_memory_admission
+                or not policy.enforce_cuda_admission
                 or not policy.probe_endpoint
                 or not policy.probe_token_file
             ):
-                raise ValueError("GPU capabilities require a resource policy with required probe and memory admission")
+                raise ValueError(
+                    "GPU capabilities require a resource policy with required probe, "
+                    "host-memory admission, and CUDA admission"
+                )
             profile_lifecycles: dict[str, bool] = {}
             for executor in self.executors.values():
                 for profile_id, managed in executor.gpu_profile_lifecycles().items():

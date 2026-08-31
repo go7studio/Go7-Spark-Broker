@@ -37,7 +37,11 @@ def pmon(*pids: int) -> str:
     return "\n".join(rows) + "\n"
 
 
-def policy_bytes(*profiles: dict, controller_state_files: tuple[dict, ...] = ()) -> bytes:
+def policy_bytes(
+    *profiles: dict,
+    controller_state_files: tuple[dict, ...] = (),
+    cuda_memory_probe: bool = False,
+) -> bytes:
     value = {
         "version": 1,
         "ownerId": "spark.probe",
@@ -45,6 +49,8 @@ def policy_bytes(*profiles: dict, controller_state_files: tuple[dict, ...] = ())
     }
     if controller_state_files:
         value["controllerStateFiles"] = list(controller_state_files)
+    if cuda_memory_probe:
+        value["cudaMemoryProbe"] = True
     return json.dumps(value).encode("utf-8")
 
 
@@ -100,6 +106,10 @@ class ResourceProbeTests(unittest.TestCase):
         policy: ProbePolicy,
         commands: FixtureCommands,
         processes: FixtureProcesses,
+        cuda_memory_probe=lambda: {
+            "allocatableBytes": 16 * 1024**3,
+            "addressSpaceTotalBytes": 128 * 1024**3,
+        },
     ) -> ResourceInventory:
         return ResourceInventory(
             policy,
@@ -109,6 +119,7 @@ class ResourceProbeTests(unittest.TestCase):
             meminfo_path=self.meminfo,
             pressure_path=self.pressure,
             monotonic=lambda: 12.5,
+            cuda_memory_probe=cuda_memory_probe,
         )
 
     def test_docker_consumer_is_bound_to_pinned_image_and_cgroup(self) -> None:
@@ -147,6 +158,49 @@ class ResourceProbeTests(unittest.TestCase):
             "sampledAtMonotonic": 12.5,
         })
         self.assertEqual(value["observabilityErrors"], [])
+
+    def test_fresh_context_cuda_envelope_is_reported_when_enabled(self) -> None:
+        policy = ProbePolicy.from_bytes(policy_bytes(cuda_memory_probe=True))
+        commands = FixtureCommands({
+            ("nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"): "",
+            PMON: pmon(),
+        })
+        value = self.inventory(
+            policy,
+            commands,
+            FixtureProcesses({}),
+            cuda_memory_probe=lambda: {
+                "allocatableBytes": 15 * 1024**3,
+                "addressSpaceTotalBytes": 128 * 1024**3,
+            },
+        ).snapshot()
+
+        self.assertEqual(value["health"], "healthy")
+        self.assertEqual(value["metrics"]["cudaAllocatableBytes"], 15 * 1024**3)
+        self.assertEqual(
+            value["metrics"]["cudaAddressSpaceTotalBytes"], 128 * 1024**3
+        )
+
+    def test_enabled_cuda_probe_failure_degrades_inventory(self) -> None:
+        policy = ProbePolicy.from_bytes(policy_bytes(cuda_memory_probe=True))
+        commands = FixtureCommands({
+            ("nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"): "",
+            PMON: pmon(),
+        })
+
+        def unavailable():
+            raise RuntimeError("driver unavailable")
+
+        value = self.inventory(
+            policy,
+            commands,
+            FixtureProcesses({}),
+            cuda_memory_probe=unavailable,
+        ).snapshot()
+
+        self.assertEqual(value["health"], "degraded")
+        self.assertIsNone(value["metrics"]["cudaAllocatableBytes"])
+        self.assertIn("cuda_memory_unobservable", value["observabilityErrors"])
 
     def test_docker_cgroup_accepts_only_full_or_canonical_short_identity(self) -> None:
         profile = {

@@ -36,6 +36,10 @@ class FakeTextHandler(BaseHTTPRequestHandler):
                     "ownerId": "test.governor",
                 }},
                 "controllerStates": {},
+                "metrics": {
+                    "cudaAllocatableBytes": 64 * 1024**3,
+                    "cudaAddressSpaceTotalBytes": 128 * 1024**3,
+                },
             }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
