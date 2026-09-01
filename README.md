@@ -156,6 +156,11 @@ package, protocol, CLI/MCP, and artifact paths without touching live GPU work.
 directories, keeps separate state and credentials, checks readiness, and
 restores the previous canary release if the health gate fails.
 
+The 2026-08-31 small-model, SGLang parallelism, and checkpointable-training
+measurements are recorded in the
+[model bake-off handoff](docs/MODEL-BAKEOFF-HANDOFF-2026-08-31.md). They define a
+shadow-test hypothesis and do not authorize a production route or trainer.
+
 `deploy-user.sh` supplies the token and data paths when they are omitted from
 an imported configuration. With the shipped user service, keep data beneath
 `~/.local/share/go7-spark-broker/` and writable workloads beneath that directory
